@@ -7,7 +7,7 @@ echo Setting up environment...
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
 
 echo Compiling with CL...
-cl /EHsc /openmp:llvm /Fe:coax_pack_cpu.exe coax_pack_cpu.cpp
+cl /EHsc /openmp:llvm /std:c++17 /Fe:coax_pack_cpu.exe coax_pack_cpu.cpp
 
 if %ERRORLEVEL%==0 (
     echo Compilation successful! Executable: coax_pack_cpu.exe 

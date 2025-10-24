@@ -18,8 +18,8 @@ REM -------------------- User Parameters ---------------------------
 set DEBUG_LEVEL=1
 set NATOMS_MAX=25000
 set DT=1e-6
-set NITER=40000
-set DUMP_INTERVAL=1000
+set NITER=400000
+set DUMP_INTERVAL=2500
 set SEED=42
 
 REM Geometry [m]
@@ -28,16 +28,19 @@ set ROUT=40e-6
 set LENGTH=380e-6
 
 REM Physics
-set FLUX=6000
+set FLUX=60000
 set GRAVITY=9.81
 set SHAKE_FREQ=300
-set SHAKE_AMP=0
+set SHAKE_AMP=0.1e-6
 
 REM Process stages [s]
 set FILL_TIME=8.0
 set RAM_START=0.0
 set RAM_DURATION=0.0
 set RAM_SPEED=0.0
+
+REM Volume Fraction Target
+set VF=0.5
 REM ----------------------------------------------------------------
 
 cd /d "%~dp0"
@@ -64,7 +67,8 @@ echo   Rin, Rout, L   = %RIN%, %ROUT%, %LENGTH%
 echo   Flux           = %FLUX%
 echo   Gravity        = %GRAVITY%
 echo   Shake (Hz, Amp)= %SHAKE_FREQ%, %SHAKE_AMP%
-echo   Fill/Ram       = %FILL_TIME%s / %RAM_START%s→%RAM_DURATION%s @ %RAM_SPEED%m/s
+echo   Fill/Ram       = %FILL_TIME%s / %RAM_START%s to %RAM_DURATION%s @ %RAM_SPEED%m/s
+echo   VF Target      = %VF%
 echo ===============================================================
 
 REM -------------------- Run the executable ------------------------
@@ -85,7 +89,8 @@ REM -------------------- Run the executable ------------------------
   %FILL_TIME% ^
   %RAM_START% ^
   %RAM_DURATION% ^
-  %RAM_SPEED%
+  %RAM_SPEED% ^
+  %VF%
 
 REM -------------------- Timing and Status -------------------------
 for /f "tokens=1-4 delims=:." %%a in ("%TIME%") do (
