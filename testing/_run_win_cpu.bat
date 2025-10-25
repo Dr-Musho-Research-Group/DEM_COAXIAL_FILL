@@ -18,7 +18,7 @@ REM -------------------- User Parameters ---------------------------
 set DEBUG_LEVEL=1
 set NATOMS_MAX=25000
 set DT=1e-6
-set NITER=400000
+set NITER=100000
 set DUMP_INTERVAL=2500
 set SEED=42
 
@@ -30,8 +30,8 @@ set LENGTH=380e-6
 REM Physics
 set FLUX=60000
 set GRAVITY=9.81
-set SHAKE_FREQ=300
-set SHAKE_AMP=0.1e-6
+set SHAKE_FREQ=1000
+set SHAKE_AMP=5E-6
 
 REM Process stages [s]
 set FILL_TIME=8.0
@@ -40,7 +40,7 @@ set RAM_DURATION=0.0
 set RAM_SPEED=0.0
 
 REM Volume Fraction Target
-set VF=0.5
+set VF=0.7
 REM ----------------------------------------------------------------
 
 cd /d "%~dp0"

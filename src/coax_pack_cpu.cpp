@@ -105,8 +105,8 @@ int   g_flux;                  // spheres/sec
 real g_g = 9.81f;             // m/s^2 downward
 
 // shaking (container vertical acceleration via frame motion)
-real g_shake_hz = 100;
-real g_shake_amp = 0.1e-6;      // meters
+real g_shake_hz = 1000;
+real g_shake_amp = 9.81;      // meters
 
 // drag
 real g_air_visc = 1.8e-5;      // Pa·s (air)
@@ -124,7 +124,7 @@ real g_ram_speed = 0.0;      // downward (positive)
 real g_density = 2000.0;     // kg/m^3 (default)
 real g_e_pp = 0.45f;          // restitution particle-particle
 real g_e_pw = 0.45f;          // restitution particle-wall
-real g_tangent_damp = 0.45f;  // simple tangential vel damping
+real g_tangent_damp = 0.85f;  // simple tangential vel damping
 
 // neighbor grid
 real g_cell_h;                // cell size ~ max_diam
@@ -446,11 +446,31 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
         }
     }
 }
-static inline real vertical_shake_accel(real t){
-    if (g_shake_hz <= 0.0 || g_shake_amp == 0.0) return 0.0;
+
+static inline real vertical_shake_accel(real t)
+{
+    if (g_shake_hz <= 0.0 || g_shake_amp == 0.0)
+        return 0.0;
+
+    // Base frequency
     const real w = 2.0 * M_PI * g_shake_hz;
-    return -(w*w) * g_shake_amp * std::sin(w * t);
+
+    // Static RNG (thread-safe via thread_local)
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<real> noise_phase(0.0, 2.0 * M_PI);
+    std::uniform_real_distribution<real> noise_amp(0.8, 1.2);  // ±20% amplitude variation
+
+    // Introduce slow phase drift and random amplitude per call
+    const real random_phase = noise_phase(rng);
+    const real amp = g_shake_amp * noise_amp(rng);
+
+    // Optional: small frequency jitter (±5%)
+    std::uniform_real_distribution<real> noise_freq(0.95, 1.05);
+    const real wf = w * noise_freq(rng);
+
+    return -(wf * wf) * amp * std::sin(wf * t + random_phase);
 }
+
 // uniform point in annulus cross-section for injection (x,y), at z ~ L + margin
 inline void sample_injection_xy(std::mt19937& rng, real rp, real& x, real& y){
     std::uniform_real_distribution<real> U01(0.0, 1.0);
@@ -898,7 +918,7 @@ int main(int argc, char** argv){
             if (phi >= g_phi_target) {
                 g_phi_reached = true;
                 g_g_run = 0.0;         // zero gravity
-                g_shake_hz = 0.0;      // stop shaking
+                //g_shake_hz = 0.0;      // stop shaking
                 g_ram_speed = 0.0;     // freeze top lid motion
                 g_ram_dt = 0.0;
                 // wake everyone once so they can relax to rest under zero-g + damping
@@ -943,7 +963,7 @@ int main(int argc, char** argv){
                         real z = g_L + 2*r;
                         Particle a;
                         a.p = {x,y,z};
-                        a.v = {0,0,-0.2}; // small downward initial velocity
+                        a.v = {0,0,-0.5}; // small downward initial velocity
                         a.a = {0,0,0};
                         a.r = r;
                         // mass from per-type density if specified, else global
@@ -1119,7 +1139,7 @@ int main(int argc, char** argv){
                     if (a.calm_steps >= g_sleep_N) {
                         a.asleep = true;
                         a.v = {0,0,0};  // lock it
-                        a.a = {0,0,0};  // lock it
+                        //a.a = {0,0,0};  // lock it
                     }
                 } else {
                     a.calm_steps = 0;
