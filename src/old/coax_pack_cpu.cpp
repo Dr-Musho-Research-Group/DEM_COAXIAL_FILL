@@ -48,43 +48,12 @@
 #include <algorithm>
 #include <random>
 #include <string>
+#include <omp.h>
 #include <array>
-
-#include <unordered_map>
-#include <cctype>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-
-
-// --------------------- Threading (OpenMP preferred) ---------------------
-// This code targets MSVC/Windows and GCC/Clang/Linux. Prefer OpenMP for
-// per-particle parallel loops. If OpenMP is not enabled, execution falls back
-// to serial loops (still functional, just slower).
-
-#if defined(_OPENMP)
-  #include <omp.h>
-#endif
-
-// 0 => OpenMP default, 1 => serial, >1 => request that many threads (OpenMP)
-static int g_threads = 0;
-
-static inline int effective_threads(){
-#if defined(_OPENMP)
-    if (g_threads > 0) return g_threads;
-    return omp_get_max_threads();
-#else
-    return 1;
-#endif
-}
-
-static inline void apply_thread_request(){
-#if defined(_OPENMP)
-    if (g_threads > 0) omp_set_num_threads(g_threads);
-#endif
-}
-
 
 // ------------------------------ Types ------------------------------
 using real = double;
@@ -130,10 +99,6 @@ int   g_natoms_max;
 real g_dt;
 int   g_niter;
 int   g_dump_interval;
-int   g_xyz_interval = -1;       // -1 => follow dump_interval
-int   g_vtk_interval = -1;       // -1 => follow dump_interval
-int   g_vtk_domain_interval = 0; // 0 => off
-int   g_vtk_domain_segments = 96; // cylinder tessellation
 
 real g_Rin, g_Rout, g_L;
 int   g_flux;                  // spheres/sec
@@ -359,71 +324,6 @@ void dump_xyz(const std::vector<Particle>& P, int iter){
     std::fclose(f);
 }
 
-
-// VTK domain geometry (annulus walls + bottom + current top plane).
-// Outputs a simple POLYDATA surface mesh (triangulated quads) for visualization.
-// NOTE: This is visualization-only. It does not represent a CFD mesh.
-void dump_domain_vtk(real top_z, int iter){
-    if (g_vtk_domain_interval <= 0) return;
-    char fn[96]; std::snprintf(fn,sizeof(fn),"domain.%d.vtk",iter);
-    FILE* f = std::fopen(fn,"w");
-    if(!f){ std::perror("vtk-domain"); return; }
-
-    const int N = std::max(12, g_vtk_domain_segments);
-    const real z0 = 0.0;
-    const real z1 = top_z; // current piston plane
-    const real rin = g_Rin;
-    const real rout = g_Rout;
-
-    // points: inner ring (z0,z1) + outer ring (z0,z1)
-    const int nPts = 4*N;
-    std::fprintf(f,"# vtk DataFile Version 2.0\nCoax domain\nASCII\nDATASET POLYDATA\n");
-    std::fprintf(f,"POINTS %d float\n", nPts);
-
-    auto emit_ring = [&](real r, real z){
-        for(int i=0;i<N;++i){
-            real th = (2.0*M_PI*real(i))/real(N);
-            real x = r*std::cos(th);
-            real y = r*std::sin(th);
-            std::fprintf(f,"%g %g %g\n", x, y, z);
-        }
-    };
-
-    // order: inner(z0), inner(z1), outer(z0), outer(z1)
-    emit_ring(rin, z0);
-    emit_ring(rin, z1);
-    emit_ring(rout, z0);
-    emit_ring(rout, z1);
-
-    auto idxPt = [&](int ring, int i)->int{
-        i = (i%N + N)%N;
-        return ring*N + i;
-    };
-
-    const int nTris = 8*N; // 2 tris per quad, 4 quad sets
-    std::fprintf(f,"POLYGONS %d %d\n", nTris, nTris*4);
-
-    auto emit_quad_as_tris = [&](int a,int b,int c,int d){
-        std::fprintf(f,"3 %d %d %d\n", a,b,c);
-        std::fprintf(f,"3 %d %d %d\n", a,c,d);
-    };
-
-    for(int i=0;i<N;++i){
-        int i1 = (i+1)%N;
-
-        // inner wall
-        emit_quad_as_tris(idxPt(0,i), idxPt(0,i1), idxPt(1,i1), idxPt(1,i));
-        // outer wall
-        emit_quad_as_tris(idxPt(2,i), idxPt(3,i), idxPt(3,i1), idxPt(2,i1));
-        // bottom cap (annulus)
-        emit_quad_as_tris(idxPt(0,i), idxPt(2,i), idxPt(2,i1), idxPt(0,i1));
-        // top cap (annulus)
-        emit_quad_as_tris(idxPt(1,i), idxPt(1,i1), idxPt(3,i1), idxPt(3,i));
-    }
-
-    std::fclose(f);
-}
-
 void dump_vtk(const std::vector<Particle>& P, int iter){
     char fn[64]; std::snprintf(fn,sizeof(fn),"atom.%d.vtk",iter);
     FILE* f = std::fopen(fn,"w");
@@ -521,7 +421,7 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
         const real w     = (g_sd_sweeps > 1) ? (real(s) / real(g_sd_sweeps - 1)) : 0.0;
         const real alpha = g_sd_alpha0 + (g_sd_alpha1 - g_sd_alpha0) * w; // ramp up
         const real keep  = clamp_val<real>(1.0 - alpha, (real)0.0, (real)1.0);
-#if defined(_OPENMP)
+
         #pragma omp parallel for
         for (int i = 0; i < (int)P.size(); ++i) {
             auto &a = P[i];
@@ -544,31 +444,6 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
             if (std::abs(a.v.y) < g_sd_vcut) a.v.y = 0.0;
             if (std::abs(a.v.z) < g_sd_vcut) a.v.z = 0.0;
         }
-#else
-        struct SD_Ctx { std::vector<Particle>* P; real keep, z_guard, z_guard_lo; };
-        auto sd_worker = [](int i, void* vctx){
-            SD_Ctx* c = (SD_Ctx*)vctx;
-            auto &a = (*(c->P))[i];
-            if (a.asleep) return;
-            if (a.p.z > c->z_guard_lo) return;
-
-            a.v.x *= c->keep; a.v.y *= c->keep; a.v.z *= c->keep;
-
-            const bool near_floor = (a.p.z <= (a.r + 1e-12));
-            const bool near_top = (a.p.z >= c->z_guard);
-            const real keep_xy = near_top ? c->keep : (near_floor ? c->keep * (1.0 - g_sd_tan_boost) : c->keep);
-            const real keep_z  = c->keep;
-            a.v.x *= clamp_val<real>(keep_xy, 0.0, 1.0);
-            a.v.y *= clamp_val<real>(keep_xy, 0.0, 1.0);
-            a.v.z *= clamp_val<real>(keep_z,  0.0, 1.0);
-
-            if (std::abs(a.v.x) < g_sd_vcut) a.v.x = 0.0;
-            if (std::abs(a.v.y) < g_sd_vcut) a.v.y = 0.0;
-            if (std::abs(a.v.z) < g_sd_vcut) a.v.z = 0.0;
-        };
-        SD_Ctx ctx{&P, keep, z_guard, z_guard_lo};
-        for (int i = 0; i < (int)P.size(); ++i) sd_worker(i, &ctx);
-#endif
     }
 }
 
@@ -943,173 +818,36 @@ inline void collide_walls(Particle& a, real top_z, real e_common)
 
 // ----------------------- Integration Loop -------------------------
 int main(int argc, char** argv){
-    auto usage = [&](int rc){
+    if (argc < 19){
         std::fprintf(stderr,
-            "Usage (legacy positional):\n"
-            "  %s natoms_max dt niter dump_interval debug seed Rin Rout L flux g shake_hz shake_amp fill_time ram_start ram_duration ram_speed phi_target\n"
-            "\n"
-            "Usage (flags, order-independent):\n"
-            "  %s [--natoms_max N] [--dt DT] [--niter N] [--dump_interval N]\n"
-            "     [--debug 0|1] [--seed S] [--rin R] [--rout R] [--length L]\n"
-            "     [--flux N] [--gravity G] [--shake_hz HZ] [--shake_amp A]\n"
-            "     [--fill_time T] [--ram_start T0] [--ram_duration DT] [--ram_speed V]\n"
-            "     [--phi_target PHI]\n"
-            "     [--threads N]\n"
-            "     [--xyz_interval N] [--vtk_interval N] [--vtk_domain_interval N] [--vtk_domain_segments N]\n",
-            argv[0], argv[0]);
-        return rc;
-    };
-
-    // -------------------- defaults (match batch-script style) --------------------
-    g_debug = 0;
-    g_seed  = 42;
-    g_natoms_max = 25000;
-    g_dt = 2e-6;
-    g_niter = 100000;
-    g_dump_interval = 500;
-
-    g_Rin = 22e-6;
-    g_Rout = 40e-6;
-    g_L = 380e-6;
-
-    g_flux = 60000;
-    g_g = 9.81;
-    g_shake_hz = 1000.0;
-    g_shake_amp = 5e-6;
-
-    g_fill_time = 8.0;
-    g_ram_t0 = 0.0;
-    g_ram_dt = 0.0;
-    g_ram_speed = 0.0;
-
-    g_phi_target = 0.0;
-
-    g_threads = 0;
-    g_xyz_interval = -1;
-    g_vtk_interval = -1;
-    g_vtk_domain_interval = 0;
-    g_vtk_domain_segments = 96;
-
-    if (argc <= 1) return usage(1);
-
-    // -------------------- parse --------------------
-    std::vector<std::string> pos;
-    std::unordered_map<std::string, std::string> kv;
-
-    auto is_flag = [&](const char* s)->bool{
-        return s && s[0]=='-' && s[1]=='-';
-    };
-    auto to_lower = [&](std::string s)->std::string{
-        for(char& c: s) c = (char)std::tolower((unsigned char)c);
-        return s;
-    };
-
-    for (int i=1; i<argc; ++i){
-        const char* a = argv[i];
-        if (!a) continue;
-        if (std::strcmp(a, "--help")==0 || std::strcmp(a, "-h")==0){
-            return usage(0);
-        }
-        if (is_flag(a)){
-            std::string key = a+2;
-            std::string val = "1";
-            auto eq = key.find('=');
-            if (eq != std::string::npos){
-                val = key.substr(eq+1);
-                key = key.substr(0, eq);
-            } else {
-                // if next token exists and is not another flag, treat it as the value
-                if (i+1 < argc && !(argv[i+1][0]=='-' && argv[i+1][1]=='-')){
-                    val = argv[++i];
-                }
-            }
-            kv[to_lower(key)] = val;
-        } else {
-            pos.emplace_back(a);
-        }
+            "Usage:\n"
+            "%s natoms_max dt niter dump_interval debug seed Rin Rout L flux g shake_hz shake_amp fill_time ram_start ram_duration ram_speed phi_target\n", argv[0]);
+        return 1;
     }
+    int iarg=1;
+    g_natoms_max   = std::atoi(argv[iarg++]);
+    g_dt           = std::atof(argv[iarg++]);
+    g_niter        = std::atoi(argv[iarg++]);
+    g_dump_interval= std::atoi(argv[iarg++]);
+    g_debug        = std::atoi(argv[iarg++]);
+    g_seed         = std::atoi(argv[iarg++]);
+    g_Rin          = std::atof(argv[iarg++]);
+    g_Rout         = std::atof(argv[iarg++]);
+    g_L            = std::atof(argv[iarg++]);
+    g_flux         = std::atoi(argv[iarg++]);
+    g_g            = std::abs(std::atof(argv[iarg++]));
+    g_shake_hz     = std::atof(argv[iarg++]);
+    g_shake_amp    = std::atof(argv[iarg++]);
+    g_fill_time    = std::atof(argv[iarg++]);
+    g_ram_t0       = std::atof(argv[iarg++]);
+    g_ram_dt       = std::atof(argv[iarg++]);
+    g_ram_speed    = std::atof(argv[iarg++]);
+    g_phi_target   = std::atof(argv[iarg++]); // <=0 disables cutoff
 
-    auto get_i = [&](const char* k, int& dst){
-        auto it = kv.find(k);
-        if (it != kv.end()) dst = std::atoi(it->second.c_str());
-    };
-    auto get_r = [&](const char* k, real& dst){
-        auto it = kv.find(k);
-        if (it != kv.end()) dst = (real)std::atof(it->second.c_str());
-    };
-
-    // Legacy positional mode if any positional args were provided.
-    // This preserves old scripts like: coax_pack_cpu.exe 20000 2e-6 ...
-    if (!pos.empty()){
-        if ((int)pos.size() < 18){
-            std::fprintf(stderr,"Error: legacy positional CLI expects 18 values (got %zu)\n", pos.size());
-            return usage(1);
-        }
-        int iarg=0;
-        g_natoms_max    = std::atoi(pos[iarg++].c_str());
-        g_dt            = std::atof(pos[iarg++].c_str());
-        g_niter         = std::atoi(pos[iarg++].c_str());
-        g_dump_interval = std::atoi(pos[iarg++].c_str());
-        g_debug         = std::atoi(pos[iarg++].c_str());
-        g_seed          = std::atoi(pos[iarg++].c_str());
-        g_Rin           = std::atof(pos[iarg++].c_str());
-        g_Rout          = std::atof(pos[iarg++].c_str());
-        g_L             = std::atof(pos[iarg++].c_str());
-        g_flux          = std::atoi(pos[iarg++].c_str());
-        g_g             = std::abs(std::atof(pos[iarg++].c_str()));
-        g_shake_hz      = std::atof(pos[iarg++].c_str());
-        g_shake_amp     = std::atof(pos[iarg++].c_str());
-        g_fill_time     = std::atof(pos[iarg++].c_str());
-        g_ram_t0        = std::atof(pos[iarg++].c_str());
-        g_ram_dt        = std::atof(pos[iarg++].c_str());
-        g_ram_speed     = std::atof(pos[iarg++].c_str());
-        g_phi_target    = std::atof(pos[iarg++].c_str()); // <=0 disables cutoff
-    } else {
-        // Flag mode (order-independent)
-        get_i("natoms_max", g_natoms_max);
-        get_r("dt", g_dt);
-        get_i("niter", g_niter);
-        get_i("dump_interval", g_dump_interval);
-        get_i("debug", g_debug);
-        get_i("seed", g_seed);
-        get_r("rin", g_Rin);
-        get_r("rout", g_Rout);
-        get_r("length", g_L);
-        get_i("flux", g_flux);
-        get_r("gravity", g_g);
-        get_r("shake_hz", g_shake_hz);
-        get_r("shake_amp", g_shake_amp);
-        get_r("fill_time", g_fill_time);
-        get_r("ram_start", g_ram_t0);
-        get_r("ram_duration", g_ram_dt);
-        get_r("ram_speed", g_ram_speed);
-        get_r("phi_target", g_phi_target);
-
-        get_i("threads", g_threads);
-        get_i("nthreads", g_threads);
-
-        get_i("xyz_interval", g_xyz_interval);
-        get_i("vtk_interval", g_vtk_interval);
-        get_i("vtk_domain_interval", g_vtk_domain_interval);
-        get_i("vtk_domain_segments", g_vtk_domain_segments);
-
-        // accept some aliases from older batch scripts
-        get_r("r_in", g_Rin);
-        get_r("r_out", g_Rout);
-    }
-
-#if defined(_OPENMP)
-    if (g_threads > 0) omp_set_num_threads(g_threads);
-#endif
-
-    // resolve output intervals (default: follow dump_interval)
-    if (g_xyz_interval < 0) g_xyz_interval = g_dump_interval;
-    if (g_vtk_interval < 0) g_vtk_interval = g_dump_interval;
-
-    real phi = 0.0; // volume fraction estimate
+    real phi = 0.0; //volume fraction estimate 
 
     // init multi-type defaults (copies type 0 into 1..3 unless you override)
-init_default_distributions_once();
+    init_default_distributions_once();
     // normalize fractions once; allow user to set g_type_frac[] later
     real fsum = g_type_frac[0] + g_type_frac[1] + g_type_frac[2] + g_type_frac[3];
     if (fsum <= 0) { g_type_frac[0]=1.0; g_type_frac[1]=g_type_frac[2]=g_type_frac[3]=0.0; fsum=1.0; }
@@ -1204,7 +942,6 @@ init_default_distributions_once();
                 int oldN = (int)P.size();
                 P.resize(oldN + want);
                 // Per-thread RNGs to avoid races and XY bias
-#if defined(_OPENMP)
                 #pragma omp parallel
                 {
                     const int tid = omp_get_thread_num();
@@ -1237,44 +974,13 @@ init_default_distributions_once();
                             }
                             a.m = rho * (4.0/3.0) * real(M_PI) * r*r*r;
                         }
-                        a.type_id = (uint8_t)(t_id & 0xFF);
+                        a.type_id = (uint8_t)(t_id & 0xFF);                        
                         a.asleep = false;
                         a.calm_steps = 0;
                         a.prev_p = a.p;
                         P[oldN+k] = a;
                     }
                 } // omp parallel
-#else
-                // Serial fallback when OpenMP is not enabled
-                std::mt19937 trng((unsigned)g_seed + (unsigned)it*101u);
-                for (int k=0;k<want;++k){
-                    real d; real r; real x; real y;
-                    int  t_id;
-                    for(;;){
-                        t_id = sample_type(trng);
-                        d = sample_diameter_for_type(trng, t_id);
-                        r = 0.5*d;
-                        sample_injection_xy(trng, r, x, y);
-                        if (x==x && y==y) break;
-                    }
-                    real z = g_L + 2*r;
-                    Particle a;
-                    a.p = {x,y,z};
-                    a.v = {0,0,-0.5};
-                    a.a = {0,0,0};
-                    a.r = r;
-                    {
-                        real rho = g_density;
-                        if (t_id>=0 && t_id<4 && g_density_type[t_id] > 0.0) rho = g_density_type[t_id];
-                        a.m = rho * (4.0/3.0) * real(M_PI) * r*r*r;
-                    }
-                    a.type_id = (uint8_t)(t_id & 0xFF);
-                    a.asleep = false;
-                    a.calm_steps = 0;
-                    a.prev_p = a.p;
-                    P[oldN+k] = a;
-                }
-#endif
                 injected_total += want;
                 // update running volume cheaply for new range
                 for (int k = oldN; k < oldN + want; ++k) {
@@ -1367,7 +1073,6 @@ init_default_distributions_once();
 
         // 4.9) set accelerations for this step: gravity + shake + Stokes drag
         const real a_shake = vertical_shake_accel(t);
-#if defined(_OPENMP)
         #pragma omp parallel for
         for (int i=0; i<(int)P.size(); ++i){
             auto &a = P[i];
@@ -1381,26 +1086,8 @@ init_default_distributions_once();
                 a.a.z -= (g_g_run + a_shake);
             }
         }
-#else
-        struct AccelCtx { std::vector<Particle>* P; real a_shake; };
-        auto accel_worker = [](int i, void* vctx){
-            AccelCtx* c = (AccelCtx*)vctx;
-            auto &a = (*(c->P))[i];
-            a.a.x = 0.0; a.a.y = 0.0; a.a.z = 0.0;
-            if (!a.asleep) {
-                a.a.x += c->a_shake;
-                a.a.y += c->a_shake;
-                a.a.z -= (g_g_run + c->a_shake);
-            }
-        };
-        AccelCtx ctxA{&P, a_shake};
-        for (int i = 0; i < (int)P.size(); ++i) accel_worker(i, &ctx);
-#endif
-
         // 5) integrate (Velocity Verlet: here simple symplectic Euler style for brevity)
         real zTop = zTop_now;
-
-#if defined(_OPENMP)
         #pragma omp parallel for
         for (int i=0;i<(int)P.size();++i){
             auto &a = P[i];
@@ -1414,7 +1101,6 @@ init_default_distributions_once();
                 a.p.y += a.v.y * g_dt;
                 a.p.z += a.v.z * g_dt;
             }
-
             // Always enforce walls (incl. bottom) to prevent “sleep drift”
             collide_walls(a, zTop, g_e_pw);
 
@@ -1425,15 +1111,27 @@ init_default_distributions_once();
                 if (a.v.z < 0.0) a.v.z = 0.0;
             }
 
-            // Sleep logic
+            // Final inner-radius guard to suppress FP noise creeping inside Rin+r
+            //const real rmin = g_Rin + P[i].r;
+           // real rxy = std::hypot(P[i].p.x, P[i].p.y);
+            //if (rxy < rmin){
+            //    if (rxy > 1e-15){
+            //        const real s = (rmin + 1e-12) / rxy;
+            //        P[i].p.x *= s; P[i].p.y *= s;
+            //    } else {
+             //       P[i].p.x = rmin + 1e-12; P[i].p.y = 0;
+            //    }
+            //}
+
+            // check near-floor *or* near-zero accel/vel; you can broaden to "resting anywhere"
             bool slow = (std::abs(a.v.z) < g_sleep_v) &&
                         (a.v.x*a.v.x + a.v.y*a.v.y < g_sleep_v*g_sleep_v);
 
             Vec3 dp = {a.p.x - a.prev_p.x, a.p.y - a.prev_p.y, a.p.z - a.prev_p.z};
             bool on_floor = (a.p.z <= (a.r + 1e-12));
             bool not_moving = (std::abs(dp.x) < g_sleep_dz &&
-                               std::abs(dp.y) < g_sleep_dz &&
-                               std::abs(dp.z) < g_sleep_dz);
+                            std::abs(dp.y) < g_sleep_dz &&
+                            std::abs(dp.z) < g_sleep_dz);
 
             if (!a.asleep) {
                 if (on_floor && slow && not_moving) {
@@ -1441,6 +1139,7 @@ init_default_distributions_once();
                     if (a.calm_steps >= g_sleep_N) {
                         a.asleep = true;
                         a.v = {0,0,0};  // lock it
+                        //a.a = {0,0,0};  // lock it
                     }
                 } else {
                     a.calm_steps = 0;
@@ -1449,56 +1148,6 @@ init_default_distributions_once();
 
             a.prev_p = a.p; // update history every step
         }
-#else
-        struct IntegrateCtx { std::vector<Particle>* P; real zTop; };
-        auto integ_worker = [](int i, void* vctx){
-            IntegrateCtx* c = (IntegrateCtx*)vctx;
-            auto &a = (*(c->P))[i];
-
-            if (!a.asleep) {
-                a.v.x += a.a.x * g_dt;
-                a.v.y += a.a.y * g_dt;
-                a.v.z += a.a.z * g_dt;
-                a.p.x += a.v.x * g_dt;
-                a.p.y += a.v.y * g_dt;
-                a.p.z += a.v.z * g_dt;
-            }
-
-            collide_walls(a, c->zTop, g_e_pw);
-
-            const real zbot_guard = a.r;
-            if (a.p.z < zbot_guard) {
-                a.p.z = zbot_guard;
-                if (a.v.z < 0.0) a.v.z = 0.0;
-            }
-
-            bool slow = (std::abs(a.v.z) < g_sleep_v) &&
-                        (a.v.x*a.v.x + a.v.y*a.v.y < g_sleep_v*g_sleep_v);
-
-            Vec3 dp = {a.p.x - a.prev_p.x, a.p.y - a.prev_p.y, a.p.z - a.prev_p.z};
-            bool on_floor = (a.p.z <= (a.r + 1e-12));
-            bool not_moving = (std::abs(dp.x) < g_sleep_dz &&
-                               std::abs(dp.y) < g_sleep_dz &&
-                               std::abs(dp.z) < g_sleep_dz);
-
-            if (!a.asleep) {
-                if (on_floor && slow && not_moving) {
-                    a.calm_steps++;
-                    if (a.calm_steps >= g_sleep_N) {
-                        a.asleep = true;
-                        a.v = {0,0,0};
-                    }
-                } else {
-                    a.calm_steps = 0;
-                }
-            }
-
-            a.prev_p = a.p;
-        };
-        IntegrateCtx ctxI{&P, zTop};
-        for (int i = 0; i < (int)P.size(); ++i) worker(i, &ctx);
-#endif
-
 
         // 5.5) successive damping sweeps (fast settling)
         if (g_phi_reached) {
@@ -1506,14 +1155,10 @@ init_default_distributions_once();
         }
 
         // 7) dumps & monitor
-        if ( (g_dump_interval>0 && (it % g_dump_interval) == 0) ||
-             (g_xyz_interval>0 && (it % g_xyz_interval) == 0) ||
-             (g_vtk_interval>0 && (it % g_vtk_interval) == 0) ||
-             (g_vtk_domain_interval>0 && (it % g_vtk_domain_interval) == 0) ){
+        if ( (it % g_dump_interval) == 0 ){
             if (!P.empty()){
-                if (g_xyz_interval > 0 && (it % g_xyz_interval)==0) dump_xyz(P, it);
-                if (g_vtk_interval > 0 && (it % g_vtk_interval)==0) dump_vtk(P, it);
-                if (g_vtk_domain_interval > 0 && (it % g_vtk_domain_interval)==0) dump_domain_vtk(zTop_now, it);
+                dump_xyz(P, it);
+                dump_vtk(P, it);
             }
             real E=0.0, sumz=0.0;
             #pragma omp parallel for reduction(+:E,sumz)

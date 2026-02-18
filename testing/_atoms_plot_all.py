@@ -26,22 +26,39 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # -------------------- Helper: parse batch variables --------------------
 def parse_batch_vars(filename):
+    """Parse numeric 'set VAR=VALUE' assignments from a Windows .bat file.
+    Accepts both:   set VAR=123   and   set "VAR=123"
+    Silently ignores non-numeric values (paths, '..', %variables%, etc.).
+    """
     vals = {}
     if not os.path.exists(filename):
         return vals
-    pattern = re.compile(r"set\s+([A-Za-z_]+)\s*=\s*([0-9Ee\.\+\-]+)")
-    with open(filename, "r") as f:
-        for line in f:
-            m = pattern.search(line)
-            if m:
-                key, val = m.group(1).strip().upper(), float(m.group(2))
-                vals[key] = val
+    # Match: set VAR=VALUE   or   set "VAR=VALUE"   (VALUE may be unquoted)
+    pat = re.compile(r"^\s*set\s+(?:\"?)([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)(?:\"?)\s*$", re.IGNORECASE)
+    with open(filename, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.lower().startswith("rem"):
+                continue
+            m = pat.match(line)
+            if not m:
+                continue
+            key = m.group(1).strip().upper()
+            val_s = m.group(2).strip().strip('"')
+            # Skip values that obviously are not plain numbers
+            if any(c in val_s for c in ["%", "\\", ":", "(", ")"]):
+                continue
+            try:
+                vals[key] = float(val_s)
+            except Exception:
+                # e.g., '..' or other non-numeric tokens
+                continue
     return vals
-
 batch_vals = parse_batch_vars("_run_win_cpu.bat")
 
 # -------------------- Args & env --------------------
 ap = argparse.ArgumentParser()
+ap.add_argument("--pattern", default="atoms_*.xyz", help="Glob for frame files (default: atoms_*.xyz)")
 ap.add_argument("--rin", type=float, default=batch_vals.get("RIN"))
 ap.add_argument("--rout", type=float, default=batch_vals.get("ROUT"))
 ap.add_argument("--length", type=float, default=batch_vals.get("LENGTH"))
@@ -72,11 +89,11 @@ print(f"  Color mode: {color_mode}\n")
 
 # -------------------- Discover frames --------------------
 xyz_files = sorted(
-    glob.glob("atoms_*.xyz"),
+    glob.glob(args.pattern),
     key=lambda x: int(re.search(r"atoms_(\d+)\.xyz$", x).group(1)) if re.search(r"atoms_(\d+)\.xyz$", x) else 0
 )
 if not xyz_files:
-    print("No atoms_*.xyz files found.")
+    print(f"No files found for pattern: {args.pattern}")
     raise SystemExit(1)
 if LIMIT:
     xyz_files = xyz_files[:LIMIT]
@@ -85,31 +102,60 @@ print(f"Found {len(xyz_files)} frames.")
 # -------------------- Loading --------------------
 def read_xyz_positions_symbols(fn):
     """Return (iter_idx, pos[N,3], diam[N], symbols[N]) from XYZ.
-       Supports 'SYMBOL x y z d' or 'x y z d' (symbol='X')."""
-    with open(fn, "r") as f:
-        N = int(f.readline().strip())
+       Supported per-particle row formats (extra columns are ignored):
+         1) SYMBOL x y z d ...        (SYMBOL like La/Sr/Fe/Co)
+         2) type_id x y z d ...       (type_id numeric; maps 0..3 -> La/Sr/Fe/Co)
+         3) x y z d ...               (fallback; symbol='X')
+    """
+    type_map = {0: 'La', 1: 'Sr', 2: 'Fe', 3: 'Co'}
+    with open(fn, 'r', encoding='utf-8', errors='ignore') as f:
+        first = f.readline()
+        if not first:
+            raise ValueError(f'Empty file: {fn}')
+        N = int(first.strip())
         hdr = f.readline().strip()
         m = re.search(r'iter\s+(\d+)', hdr, flags=re.IGNORECASE)
         it = int(m.group(1)) if m else 0
 
-        pos = np.zeros((N,3), dtype=float)
+        pos = np.zeros((N, 3), dtype=float)
         diam = np.zeros(N, dtype=float)
-        symbols = []
-        for i, line in enumerate(f):
+        symbols = np.empty(N, dtype=object)
+
+        j = 0
+        for line in f:
+            if j >= N:
+                break
             if not line.strip():
                 continue
             toks = line.split()
-            # If first token is alpha -> symbol present
-            if toks and not is_float(toks[0]):
+            if not toks:
+                continue
+
+            if not is_float(toks[0]):
+                # SYMBOL x y z d ...
                 sym = toks[0]
                 x, y, z, d = map(float, toks[1:5])
             else:
-                sym = 'X'
-                x, y, z, d = map(float, toks[0:4])
-            pos[i,:] = (x, y, z)
-            diam[i] = d
-            symbols.append(sym)
-        symbols = np.array(symbols, dtype=object)
+                # Numeric first token: could be type_id x y z d ... OR x y z d ...
+                if len(toks) >= 5 and is_int_like(toks[0]) and all(is_float(t) for t in toks[1:5]):
+                    tid = int(float(toks[0]))
+                    sym = type_map.get(tid, str(tid))
+                    x, y, z, d = map(float, toks[1:5])
+                else:
+                    sym = 'X'
+                    x, y, z, d = map(float, toks[0:4])
+
+            pos[j, :] = (x, y, z)
+            diam[j] = d
+            symbols[j] = sym
+            j += 1
+
+        if j != N:
+            # Tolerate short reads but resize to what we actually got
+            pos = pos[:j, :]
+            diam = diam[:j]
+            symbols = symbols[:j]
+
     return it, pos, diam, symbols
 
 def is_float(s):
@@ -119,6 +165,19 @@ def is_float(s):
     except Exception:
         return False
 
+
+def is_int_like(s):
+    """True if token looks like an integer (no decimal point/exponent)."""
+    s = s.strip()
+    if not s:
+        return False
+    if any(c in s.lower() for c in ['.', 'e']):
+        return False
+    try:
+        int(s)
+        return True
+    except Exception:
+        return False
 iters, frames_pos, frames_d, frames_sym = [], [], [], []
 print("Scanning frames for bounds and diameters...")
 for fn in xyz_files:

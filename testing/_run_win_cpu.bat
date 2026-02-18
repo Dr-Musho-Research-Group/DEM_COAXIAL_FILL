@@ -3,7 +3,7 @@ setlocal EnableDelayedExpansion
 
 REM ================================================================
 REM  Batch script to run coax_pack_cpu.exe simulation
-REM  Similar format to md_ess.bat but adapted for 3D coaxial fill DEM
+REM  Uses order-independent --flags (defaults handled in the exe)
 REM ================================================================
 
 REM Record start time
@@ -17,15 +17,18 @@ for /f "tokens=1-4 delims=:." %%a in ("%TIME%") do (
 REM -------------------- User Parameters ---------------------------
 set DEBUG_LEVEL=1
 set NATOMS_MAX=25000
-set DT=1e-6
+set DT=2e-6
 set NITER=100000
-set DUMP_INTERVAL=2500
+set DUMP_INTERVAL=500
 set SEED=42
 
+REM Threads: set to 0 to auto-use NUMBER_OF_PROCESSORS
+set THREADS=0
+
 REM Geometry [m]
-set RIN=22e-6
-set ROUT=40e-6
-set LENGTH=380e-6
+set RIN=23e-6
+set ROUT=39e-6
+set LENGTH=379e-6
 
 REM Physics
 set FLUX=60000
@@ -40,10 +43,23 @@ set RAM_DURATION=0.0
 set RAM_SPEED=0.0
 
 REM Volume Fraction Target
-set VF=0.7
+set VF=0.45
+
+REM Output frequency control (0 disables optional outputs)
+REM Note: vtk_interval controls particle VTK frequency
+REM       vtk_domain_interval controls domain surface VTK frequency
+set XYZ_INTERVAL=
+set VTK_INTERVAL=%DUMP_INTERVAL%
+set VTK_DOMAIN_INTERVAL=0
+set VTK_DOMAIN_SEGMENTS=96
 REM ----------------------------------------------------------------
 
 cd /d "%~dp0"
+
+REM Auto thread count if requested
+if "%THREADS%"=="0" (
+    set THREADS=%NUMBER_OF_PROCESSORS%
+)
 
 echo ===============================================================
 echo Cleaning previous output files...
@@ -57,40 +73,55 @@ echo ===============================================================
 
 echo Running coax_pack_cpu.exe ...
 echo Parameters:
-echo   NATOMS_MAX     = %NATOMS_MAX%
-echo   DT             = %DT%
-echo   NITER          = %NITER%
-echo   DUMP_INTERVAL  = %DUMP_INTERVAL%
-echo   DEBUG_LEVEL    = %DEBUG_LEVEL%
-echo   SEED           = %SEED%
-echo   Rin, Rout, L   = %RIN%, %ROUT%, %LENGTH%
-echo   Flux           = %FLUX%
-echo   Gravity        = %GRAVITY%
-echo   Shake (Hz, Amp)= %SHAKE_FREQ%, %SHAKE_AMP%
-echo   Fill/Ram       = %FILL_TIME%s / %RAM_START%s to %RAM_DURATION%s @ %RAM_SPEED%m/s
-echo   VF Target      = %VF%
+echo   NATOMS_MAX          = %NATOMS_MAX%
+echo   DT                 = %DT%
+echo   NITER              = %NITER%
+echo   DUMP_INTERVAL      = %DUMP_INTERVAL%
+echo   DEBUG_LEVEL        = %DEBUG_LEVEL%
+echo   SEED               = %SEED%
+echo   THREADS            = %THREADS%
+echo   Rin, Rout, L       = %RIN%, %ROUT%, %LENGTH%
+echo   Flux               = %FLUX%
+echo   Gravity            = %GRAVITY%
+echo   Shake (Hz, Amp)    = %SHAKE_FREQ%, %SHAKE_AMP%
+echo   Fill/Ram           = %FILL_TIME%s / %RAM_START%s to %RAM_DURATION%s @ %RAM_SPEED%m/s
+echo   VF Target          = %VF%
+echo   VTK_INTERVAL       = %VTK_INTERVAL%
+echo   VTK_DOMAIN_INTERVAL= %VTK_DOMAIN_INTERVAL%
 echo ===============================================================
 
 REM -------------------- Run the executable ------------------------
-..\src\coax_pack_cpu.exe ^
-  %NATOMS_MAX% ^
-  %DT% ^
-  %NITER% ^
-  %DUMP_INTERVAL% ^
-  %DEBUG_LEVEL% ^
-  %SEED% ^
-  %RIN% ^
-  %ROUT% ^
-  %LENGTH% ^
-  %FLUX% ^
-  %GRAVITY% ^
-  %SHAKE_FREQ% ^
-  %SHAKE_AMP% ^
-  %FILL_TIME% ^
-  %RAM_START% ^
-  %RAM_DURATION% ^
-  %RAM_SPEED% ^
-  %VF%
+REM If the exe is in a different location, update EXE path below.
+set EXE=..\src\coax_pack_cpu.exe
+
+REM Optional: if XYZ_INTERVAL is blank, do not pass it (exe will default)
+set XYZ_FLAG=
+if not "%XYZ_INTERVAL%"=="" set XYZ_FLAG=--xyz_interval %XYZ_INTERVAL%
+
+"%EXE%" ^
+  --natoms_max %NATOMS_MAX% ^
+  --dt %DT% ^
+  --niter %NITER% ^
+  --dump_interval %DUMP_INTERVAL% ^
+  --debug %DEBUG_LEVEL% ^
+  --seed %SEED% ^
+  --threads %THREADS% ^
+  --rin %RIN% ^
+  --rout %ROUT% ^
+  --length %LENGTH% ^
+  --flux %FLUX% ^
+  --gravity %GRAVITY% ^
+  --shake_hz %SHAKE_FREQ% ^
+  --shake_amp %SHAKE_AMP% ^
+  --fill_time %FILL_TIME% ^
+  --ram_start %RAM_START% ^
+  --ram_duration %RAM_DURATION% ^
+  --ram_speed %RAM_SPEED% ^
+  --phi_target %VF% ^
+  --vtk_interval %VTK_INTERVAL% ^
+  --vtk_domain_interval %VTK_DOMAIN_INTERVAL% ^
+  --vtk_domain_segments %VTK_DOMAIN_SEGMENTS% ^
+  %XYZ_FLAG%
 
 REM -------------------- Timing and Status -------------------------
 for /f "tokens=1-4 delims=:." %%a in ("%TIME%") do (
