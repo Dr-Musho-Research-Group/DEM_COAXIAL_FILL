@@ -18,8 +18,8 @@ REM -------------------- User Parameters ---------------------------
 set DEBUG_LEVEL=1
 set NATOMS_MAX=25000
 set DT=2e-6
-set NITER=50000
-set DUMP_INTERVAL=500
+set NITER=200000
+set DUMP_INTERVAL=1000
 set SEED=42
 
 REM Threads: set to 0 to auto-use NUMBER_OF_PROCESSORS
@@ -31,15 +31,15 @@ set ROUT=39e-6
 set LENGTH=379e-6
 
 REM Physics
-set FLUX=60000
-set GRAVITY=9.81
+set FLUX=20000
+set GRAVITY=0.0
 set SHAKE_FREQ=1000
-set SHAKE_AMP=3E-7
+set SHAKE_AMP=0
 
 REM Independent shake amplitudes [m]
 set SHAKE_AMP_X=%SHAKE_AMP%
 set SHAKE_AMP_Y=%SHAKE_AMP%
-set SHAKE_AMP_Z=%SHAKE_AMP%
+set SHAKE_AMP_Z=0
 set SHAKE_XY_LEGACY=0
 
 REM Contact cushion [m] (adds clearance around spheres)
@@ -51,14 +51,34 @@ set WALL_ZETA=0.20
 set WALL_DVMAX=5.0
 
 REM Wall roughness (set WALL_ROUGH_AMP=0 to disable)
-set WALL_ROUGH_AMP=2e-7
+set WALL_ROUGH_AMP=0
 set WALL_ROUGH_MTH=8
 set WALL_ROUGH_MZ=3
+
+REM Damping / restitution (set LIN_DAMP=0 to disable global damping)
+set LIN_DAMP=800.0
+set E_PP=0.20
+set E_PW=0.15
+set TANGENT_DAMP=0.90
+
+REM Short-range repulsion (set REPULSE_RANGE=0 to disable)
+set REPULSE_RANGE=0.5e-5
+set REPULSE_K_PP=2000
+set REPULSE_K_PW=500
+set REPULSE_USE_MASS=0
+set REPULSE_DVMAX=0.2
+
+REM Early-stop after phi_target is reached (all 0 disables early-stop)
+set STOP_VRMS=5e-6
+set STOP_VMAX=2e-5
+set STOP_SLEEP_FRAC=0.95
+set STOP_CHECK_INTERVAL=500
+set STOP_CHECKS_REQUIRED=10
 
 REM Injection initial velocity [m/s]
 set INJECT_VX=0.0
 set INJECT_VY=0.0
-set INJECT_VZ=-0.5
+set INJECT_VZ=-0.05
 
 REM Process stages [s]
 set FILL_TIME=8.0
@@ -67,7 +87,7 @@ set RAM_DURATION=0.0
 set RAM_SPEED=0.0
 
 REM Volume Fraction Target
-set VF=0.45
+set VF=0.25
 
 REM Output frequency control (0 disables optional outputs)
 REM Note: vtk_interval controls particle VTK frequency
@@ -113,6 +133,9 @@ echo   Fill/Ram           = %FILL_TIME%s / %RAM_START%s to %RAM_DURATION%s @ %RA
 echo   VF Target          = %VF%
 echo   Cushion            = %CUSHION%
 echo   Wall spring (k,zeta,dvmax) = %WALL_K%, %WALL_ZETA%, %WALL_DVMAX%
+echo   Damping (lin_damp,e_pp,e_pw,tangent) = %LIN_DAMP%, %E_PP%, %E_PW%, %TANGENT_DAMP%
+echo   Repulsion (range,k_pp,k_pw) = %REPULSE_RANGE%, %REPULSE_K_PP%, %REPULSE_K_PW%
+echo   Early-stop (vrms,vmax,sleep_frac) = %STOP_VRMS%, %STOP_VMAX%, %STOP_SLEEP_FRAC% (check=%STOP_CHECK_INTERVAL%, req=%STOP_CHECKS_REQUIRED%)
 echo   Inject v0 (x,y,z)  = %INJECT_VX%, %INJECT_VY%, %INJECT_VZ%
 echo   VTK_INTERVAL       = %VTK_INTERVAL%
 echo   VTK_DOMAIN_INTERVAL= %VTK_DOMAIN_INTERVAL%
@@ -152,6 +175,20 @@ if not "%XYZ_INTERVAL%"=="" set XYZ_FLAG=--xyz_interval %XYZ_INTERVAL%
   --wall_rough_amp %WALL_ROUGH_AMP% ^
   --wall_rough_mth %WALL_ROUGH_MTH% ^
   --wall_rough_mz  %WALL_ROUGH_MZ% ^
+  --lin_damp %LIN_DAMP% ^
+  --e_pp %E_PP% ^
+  --e_pw %E_PW% ^
+  --tangent_damp %TANGENT_DAMP% ^
+  --repulse_range %REPULSE_RANGE% ^
+  --repulse_k_pp %REPULSE_K_PP% ^
+  --repulse_k_pw %REPULSE_K_PW% ^
+  --repulse_use_mass %REPULSE_USE_MASS% ^
+  --repulse_dvmax %REPULSE_DVMAX% ^
+  --stop_vrms %STOP_VRMS% ^
+  --stop_vmax %STOP_VMAX% ^
+  --stop_sleep_frac %STOP_SLEEP_FRAC% ^
+  --stop_check_interval %STOP_CHECK_INTERVAL% ^
+  --stop_checks_required %STOP_CHECKS_REQUIRED% ^
   --inject_vx %INJECT_VX% ^
   --inject_vy %INJECT_VY% ^
   --inject_vz %INJECT_VZ% ^
@@ -198,11 +235,31 @@ echo Renaming output files...
 rename "output_step_*.xyz" "atoms_*.xyz" >nul 2>&1
 
 echo Running Python stat script if available...
+
 if exist "_fill_stats.py" (
-    echo _fill_stats.py atoms_%NITER%.xyz --rin %RIN% --rout %ROUT% --length %LENGTH% --rbin 100 -zbin 100 --output stats.csv
-    py.exe _fill_stats.py atoms_%NITER%.xyz --rin %RIN% --rout %ROUT% --length %LENGTH% --rbin 100 -zbin 100 --output stats.csv
+    if exist "atoms_%NITER%.xyz" (
+        echo py.exe _fill_stats.py ^
+            --rin %RIN% ^
+            --rout %ROUT% ^
+            --length %LENGTH% ^
+            --rbins 100 ^
+            --zbins 100 ^
+            --out stats.csv ^
+            atoms_%NITER%.xyz
+
+        py.exe _fill_stats.py ^
+            --rin %RIN% ^
+            --rout %ROUT% ^
+            --length %LENGTH% ^
+            --rbins 100 ^
+            --zbins 100 ^
+            --out stats.csv ^
+            atoms_%NITER%.xyz
+    ) else (
+        echo (atoms_%NITER%.xyz not found, skipping stats.)
+    )
 ) else (
-    echo (No plot script found, skipping.)
+    echo (_fill_stats.py not found, skipping stats.)
 )
 
 echo Running Python plot script if available...

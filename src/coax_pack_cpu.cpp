@@ -128,6 +128,16 @@ real g_phi_target = 0.0;
 real g_g_run = 0.0;
 bool g_phi_reached = false;
 
+// ---------------- Early-stop after phi target ----------------
+// If phi_target is reached we already disable injection and switch to zero-g.
+// These knobs optionally stop the run once the ensemble is "settled".
+// Defaults keep old behavior (run until niter).
+real g_stop_vrms = 0.0;            // [m/s] stop if RMS speed below this (0 disables)
+real g_stop_vmax = 0.0;            // [m/s] stop if max speed below this (0 disables)
+real g_stop_sleep_frac = 0.0;      // [0..1] stop if >= this fraction asleep (0 disables)
+int  g_stop_check_interval = 200;  // [steps] how often to evaluate stop criteria
+int  g_stop_checks_required = 10;  // number of consecutive successful checks
+
 int   g_natoms_max;
 real g_dt;
 int   g_niter;
@@ -169,6 +179,17 @@ real g_wall_k = 0.0;        // N/m
 real g_wall_zeta = 0.20;    // damping ratio (0..1)
 real g_wall_dvmax = 5.0;    // cap on per-step dv from spring-damper [m/s]
 
+// ---------------- Repulsive (non-contact) forces ----------------
+// Optional short-range repulsion to help particles "spread" during filling.
+// This is additive and does not replace the existing collision handling.
+//
+// Enable by setting k > 0 and a positive range. Defaults keep old behavior.
+real g_repulse_range = 0.0;   // [m] active range in *gap* space (0 disables)
+real g_repulse_k_pp  = 0.0;   // [N/m] particle-particle repulsion strength
+real g_repulse_k_pw  = 0.0;   // [N/m] particle-wall repulsion strength
+
+int  g_repulse_use_mass = 0; // 0: k is accel scale [m/s^2]; 1: k behaves like spring [N/m] divided by mass
+real g_repulse_dvmax = 0.0;  // [m/s] per-step velocity clamp from repulsion (0 disables)
 // injection initial velocity (set via CLI)
 real g_inject_vx = 0.0;
 real g_inject_vy = 0.0;
@@ -195,6 +216,10 @@ real g_density = 2000.0;     // kg/m^3 (default)
 real g_e_pp = 0.45f;          // restitution particle-particle
 real g_e_pw = 0.45f;          // restitution particle-wall
 real g_tangent_damp = 0.85f;  // simple tangential vel damping
+
+// global linear velocity damping (optional)
+// Applies v <- v * exp(-lin_damp * dt) each step (0 disables).
+real g_lin_damp = 0.0; // [1/s]
 
 // neighbor grid
 real g_cell_h;                // cell size ~ max_diam
@@ -725,6 +750,238 @@ void rebuild_grid(const std::vector<Particle>& P,
     }
 }
 
+// --------------------- Repulsive forces (optional) ---------------------
+// Adds short-range repulsive accelerations when a particle is within
+// g_repulse_range (in *gap* space) of another particle or a wall.
+//
+// Smooth ramp (C1):
+//   s = clamp(1 - gap/range, 0..1)
+//   if repulse_use_mass=1: a = (k/m) * (s*s) * n
+//   else               : a = k * (s*s) * n   (k in [m/s^2])
+// where n points away from the neighbor/wall.
+static inline void apply_repulsion_accel(std::vector<Particle>& P,
+                                        const std::vector<int>& head,
+                                        const std::vector<int>& next,
+                                        real top_z)
+{
+    if (g_repulse_range <= 0.0) return;
+    const bool use_pp = (g_repulse_k_pp > 0.0);
+    const bool use_pw = (g_repulse_k_pw > 0.0);
+    if (!use_pp && !use_pw) return;
+
+    const real eps = (real)1e-15;
+    const real range = g_repulse_range;
+
+    // Accumulate per-particle accelerations to avoid races.
+    std::vector<Vec3> acc(P.size(), Vec3{0,0,0});
+
+    if (use_pp) {
+        const real kpp = g_repulse_k_pp;
+
+#if defined(_OPENMP)
+        #pragma omp parallel for schedule(static)
+#endif
+        for (int i = 0; i < (int)P.size(); ++i) {
+            // compute i's cell
+            int ix = clampi(int(std::floor((P[i].p.x - g_minB.x)/g_cell_h)), 0, gx-1);
+            int iy = clampi(int(std::floor((P[i].p.y - g_minB.y)/g_cell_h)), 0, gy-1);
+            int iz = clampi(int(std::floor((P[i].p.z - g_minB.z)/g_cell_h)), 0, gz-1);
+
+            for (int dz=-1; dz<=1; ++dz){
+                int jz = clampi(iz+dz,0,gz-1);
+                for (int dy=-1; dy<=1; ++dy){
+                    int jy = clampi(iy+dy,0,gy-1);
+                    for (int dx=-1; dx<=1; ++dx){
+                        int jx = clampi(ix+dx,0,gx-1);
+                        int h = idx3(jx,jy,jz);
+                        for (int j=head[h]; j!=-1; j=next[j]){
+                            if (j<=i) continue;
+
+                            // Optional: still apply repulsion to sleepers (it is gentle),
+                            // but skip if both are asleep to avoid useless work.
+                            if (P[i].asleep && P[j].asleep) continue;
+
+                            Vec3 d = P[j].p - P[i].p;
+                            real dist2 = dot(d,d);
+                            if (dist2 <= eps) continue;
+                            real dist = std::sqrt(dist2);
+
+                            const real R = (P[i].r + g_cushion) + (P[j].r + g_cushion);
+                            const real gap = dist - R;
+                            if (gap <= 0.0) continue;          // overlap handled by collisions
+                            if (gap >= range) continue;        // out of range
+
+                            const real invd = (real)1.0 / dist;
+                            const Vec3 n = d * invd;           // from i -> j
+                            const real s = std::max((real)0.0, std::min((real)1.0, (real)1.0 - gap / range));
+                            real a_scale_i = kpp * (s*s);
+                            real a_scale_j = kpp * (s*s);
+                            if (g_repulse_use_mass){
+                                a_scale_i /= P[i].m;
+                                a_scale_j /= P[j].m;
+                            }
+                            const Vec3 ai = n * (-a_scale_i);  // push i away from j
+                            const Vec3 aj = n * ( +a_scale_j); // push j away from i
+
+#if defined(_OPENMP)
+                            #pragma omp atomic
+#endif
+                            acc[i].x += ai.x;
+#if defined(_OPENMP)
+                            #pragma omp atomic
+#endif
+                            acc[i].y += ai.y;
+#if defined(_OPENMP)
+                            #pragma omp atomic
+#endif
+                            acc[i].z += ai.z;
+
+#if defined(_OPENMP)
+                            #pragma omp atomic
+#endif
+                            acc[j].x += aj.x;
+#if defined(_OPENMP)
+                            #pragma omp atomic
+#endif
+                            acc[j].y += aj.y;
+#if defined(_OPENMP)
+                            #pragma omp atomic
+#endif
+                            acc[j].z += aj.z;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (use_pw) {
+        const real kpw = g_repulse_k_pw;
+#if defined(_OPENMP)
+        #pragma omp parallel for
+#endif
+        for (int i = 0; i < (int)P.size(); ++i) {
+            const Particle& a = P[i];
+            const real r_eff = a.r + g_cushion;
+
+            // Cylindrical walls
+            const real rxy = std::hypot(a.p.x, a.p.y);
+            if (rxy > eps) {
+                const real invr = (real)1.0 / rxy;
+                const Vec3 rhat = { a.p.x * invr, a.p.y * invr, 0.0 };
+
+                // inner wall: r >= Rin + r_eff (push outward)
+                {
+                    const real rmin = g_Rin + r_eff;
+                    const real gap = rxy - rmin;
+                    if (gap > 0.0 && gap < range) {
+                        const real s = std::max((real)0.0, std::min((real)1.0, (real)1.0 - gap / range));
+                        real a_scale = kpw * (s*s);
+                        if (g_repulse_use_mass) a_scale /= a.m;
+                        acc[i].x += rhat.x * (+a_scale);
+                        acc[i].y += rhat.y * (+a_scale);
+                    }
+                }
+                // outer wall: r <= Rout - r_eff (push inward)
+                {
+                    const real rmax = g_Rout - r_eff;
+                    const real gap = rmax - rxy;
+                    if (gap > 0.0 && gap < range) {
+                        const real s = std::max((real)0.0, std::min((real)1.0, (real)1.0 - gap / range));
+                        real a_scale = kpw * (s*s);
+                        if (g_repulse_use_mass) a_scale /= a.m;
+                        acc[i].x += rhat.x * (-a_scale);
+                        acc[i].y += rhat.y * (-a_scale);
+                    }
+                }
+            }
+
+            // bottom plane: z >= r_eff (push up)
+            {
+                const real gap = a.p.z - r_eff;
+                if (gap > 0.0 && gap < range) {
+                    const real s = std::max((real)0.0, std::min((real)1.0, (real)1.0 - gap / range));
+                    real a_scale = kpw * (s*s);
+                        if (g_repulse_use_mass) a_scale /= a.m;
+                    acc[i].z += (+a_scale);
+                }
+            }
+            // top plane: z <= top_z - r_eff (push down)
+            {
+                const real zmax = top_z - r_eff;
+                const real gap = zmax - a.p.z;
+                if (gap > 0.0 && gap < range) {
+                    const real s = std::max((real)0.0, std::min((real)1.0, (real)1.0 - gap / range));
+                    real a_scale = kpw * (s*s);
+                        if (g_repulse_use_mass) a_scale /= a.m;
+                    acc[i].z += (-a_scale);
+                }
+
+            // Corner anti-trap: outer-wall with bottom/top plane
+            // Helps prevent particles from pinning at the OD edge (r ~ Rout-r, z ~ r or z ~ top_z-r).
+            if (rxy > eps) {
+                const real invr = (real)1.0 / rxy;
+                const Vec3 rhat = { a.p.x * invr, a.p.y * invr, 0.0 };
+
+                const real gap_out = (g_Rout - r_eff) - rxy;     // >0 means inside domain
+                const real gap_bot = a.p.z - r_eff;              // >0 above bottom plane
+                const real gap_top = (top_z - r_eff) - a.p.z;    // >0 below top plane
+
+                auto add_corner = [&](real gap_r, real gap_z, real nz){
+                    if (gap_r > 0.0 && gap_z > 0.0 && gap_r < range && gap_z < range) {
+                        // blend strength based on proximity to both surfaces
+                        const real sr = std::max((real)0.0, std::min((real)1.0, (real)1.0 - gap_r / range));
+                        const real sz = std::max((real)0.0, std::min((real)1.0, (real)1.0 - gap_z / range));
+                        const real s  = sr * sz;
+                        // direction away from corner: inward + up (bottom) or inward + down (top)
+                        Vec3 n = { -rhat.x, -rhat.y, nz };
+                        const real nn = std::sqrt(n.x*n.x + n.y*n.y + n.z*n.z);
+                        if (nn > eps) { n.x /= nn; n.y /= nn; n.z /= nn; }
+                        real a_scale = kpw * (s*s);
+                        if (g_repulse_use_mass) a_scale /= a.m;
+                        acc[i].x += n.x * a_scale;
+                        acc[i].y += n.y * a_scale;
+                        acc[i].z += n.z * a_scale;
+                    }
+                };
+
+                // bottom outer corner: inward + up
+                add_corner(gap_out, gap_bot, +1.0);
+                // top outer corner: inward + down
+                add_corner(gap_out, gap_top, -1.0);
+            }
+            }
+        }
+    }
+
+    // Apply accumulated accelerations
+#if defined(_OPENMP)
+    #pragma omp parallel for
+#endif
+    for (int i = 0; i < (int)P.size(); ++i) {
+        if (!P[i].asleep) {
+            {
+            Vec3 aadd = acc[i];
+            if (g_repulse_dvmax > 0.0){
+                // Limit per-step delta-v from repulsion to keep things stable with tiny particle masses
+                const real dvmax = g_repulse_dvmax;
+                const real amag = std::sqrt(aadd.x*aadd.x + aadd.y*aadd.y + aadd.z*aadd.z);
+                if (amag > 0.0){
+                    const real dv = amag * g_dt;
+                    if (dv > dvmax){
+                        const real s = dvmax / dv;
+                        aadd.x *= s; aadd.y *= s; aadd.z *= s;
+                    }
+                }
+            }
+            P[i].a.x += aadd.x;
+            P[i].a.y += aadd.y;
+            P[i].a.z += aadd.z;
+        }
+        }
+    }
+}
+
 // -------------------------- Collisions -----------------------------
 inline void collide_pair(Particle& A, Particle& B, real e_common, real tdamp)
 {
@@ -1092,6 +1349,11 @@ int main(int argc, char** argv){
             "     [--flux N] [--gravity G] [--shake_hz HZ] [--shake_amp A]\n"
             "     [--fill_time T] [--ram_start T0] [--ram_duration DT] [--ram_speed V]\n"
             "     [--phi_target PHI]\n"
+            "     [--repulse_range R] [--repulse_k_pp K] [--repulse_k_pw K] [--repulse_use_mass 0|1] [--repulse_dvmax V]\n"
+            "     [--stop_vrms V] [--stop_vmax V] [--stop_sleep_frac F]\n"
+            "     [--stop_check_interval N] [--stop_checks_required N]\n"
+            "     [--lin_damp D] [--e_pp E] [--e_pw E] [--tangent_damp D]\n"
+
             "     [--wall_rough_amp A] [--wall_rough_mth M] [--wall_rough_mz M]\n"
             "     [--threads N]\n"
             "     [--xyz_interval N] [--vtk_interval N] [--vtk_domain_interval N] [--vtk_domain_segments N]\n",
@@ -1126,6 +1388,14 @@ int main(int argc, char** argv){
     g_wall_zeta = 0.20;
     g_wall_dvmax = 5.0;
 
+    g_lin_damp = 0.0; // [1/s]
+
+    g_repulse_range = 0.0;
+    g_repulse_k_pp  = 0.0;
+    g_repulse_k_pw  = 0.0;
+    g_repulse_use_mass = 0;
+    g_repulse_dvmax = 0.0;
+
     g_wall_rough_amp = 0.0;
     g_wall_rough_mth = 8;
     g_wall_rough_mz  = 3;
@@ -1142,6 +1412,12 @@ int main(int argc, char** argv){
     g_ram_speed = 0.0;
 
     g_phi_target = 0.0;
+
+    g_stop_vrms = 0.0;
+    g_stop_vmax = 0.0;
+    g_stop_sleep_frac = 0.0;
+    g_stop_check_interval = 200;
+    g_stop_checks_required = 10;
 
     g_threads = 0;
     g_xyz_interval = -1;
@@ -1248,6 +1524,11 @@ int main(int argc, char** argv){
         get_r("wall_zeta", g_wall_zeta);
         get_r("wall_dvmax", g_wall_dvmax);
 
+        get_r("lin_damp", g_lin_damp);
+        get_r("e_pp", g_e_pp);
+        get_r("e_pw", g_e_pw);
+        get_r("tangent_damp", g_tangent_damp);
+
         get_r("wall_rough_amp", g_wall_rough_amp);
         get_i("wall_rough_mth", g_wall_rough_mth);
         get_i("wall_rough_mz",  g_wall_rough_mz);
@@ -1260,6 +1541,18 @@ int main(int argc, char** argv){
         get_r("ram_duration", g_ram_dt);
         get_r("ram_speed", g_ram_speed);
         get_r("phi_target", g_phi_target);
+
+        get_r("repulse_range", g_repulse_range);
+        get_r("repulse_k_pp",  g_repulse_k_pp);
+        get_r("repulse_k_pw",  g_repulse_k_pw);
+        get_i("repulse_use_mass", g_repulse_use_mass);
+        get_r("repulse_dvmax", g_repulse_dvmax);
+
+        get_r("stop_vrms", g_stop_vrms);
+        get_r("stop_vmax", g_stop_vmax);
+        get_r("stop_sleep_frac", g_stop_sleep_frac);
+        get_i("stop_check_interval", g_stop_check_interval);
+        get_i("stop_checks_required", g_stop_checks_required);
 
         get_i("threads", g_threads);
         get_i("nthreads", g_threads);
@@ -1595,11 +1888,16 @@ init_default_distributions_once();
             }
         };
         AccelCtx ctxA{&P, a_shake_x, a_shake_y, a_shake_z};
-        for (int i = 0; i < (int)P.size(); ++i) accel_worker(i, &ctx);
+        for (int i = 0; i < (int)P.size(); ++i) accel_worker(i, &ctxA);
 #endif
+
+        // 4.95) optional short-range repulsive accelerations (pp + walls)
+        // Note: uses the already-built neighbor grid.
+        apply_repulsion_accel(P, head, next, zTop_now);
 
         // 5) integrate (Velocity Verlet: here simple symplectic Euler style for brevity)
         real zTop = zTop_now;
+        const real v_damp_fac = (g_lin_damp > 0.0 ? std::exp(-g_lin_damp * g_dt) : 1.0);
 
 #if defined(_OPENMP)
         #pragma omp parallel for
@@ -1610,6 +1908,9 @@ init_default_distributions_once();
                 a.v.x += a.a.x * g_dt;
                 a.v.y += a.a.y * g_dt;
                 a.v.z += a.a.z * g_dt;
+                a.v.x *= v_damp_fac;
+                a.v.y *= v_damp_fac;
+                a.v.z *= v_damp_fac;
                 // x_{n+1}
                 a.p.x += a.v.x * g_dt;
                 a.p.y += a.v.y * g_dt;
@@ -1660,6 +1961,9 @@ init_default_distributions_once();
                 a.v.x += a.a.x * g_dt;
                 a.v.y += a.a.y * g_dt;
                 a.v.z += a.a.z * g_dt;
+                a.v.x *= v_damp_fac;
+                a.v.y *= v_damp_fac;
+                a.v.z *= v_damp_fac;
                 a.p.x += a.v.x * g_dt;
                 a.p.y += a.v.y * g_dt;
                 a.p.z += a.v.z * g_dt;
@@ -1697,13 +2001,58 @@ init_default_distributions_once();
             a.prev_p = a.p;
         };
         IntegrateCtx ctxI{&P, zTop};
-        for (int i = 0; i < (int)P.size(); ++i) worker(i, &ctx);
+        for (int i = 0; i < (int)P.size(); ++i) integ_worker(i, &ctxI);
 #endif
 
 
         // 5.5) successive damping sweeps (fast settling)
         if (g_phi_reached) {
             successive_damping(P, zTop);
+        }
+
+        // 6) optional early stop: once phi_target reached and the ensemble settles
+        {
+            static int ok_checks = 0;
+
+            const bool want_stop = g_phi_reached && (
+                (g_stop_vrms > 0.0) || (g_stop_vmax > 0.0) || (g_stop_sleep_frac > 0.0));
+
+            if (want_stop && g_stop_check_interval > 0 && (it % g_stop_check_interval) == 0 && !P.empty()) {
+                real sumv2 = 0.0;
+                real vmax = 0.0;
+                int asleep_count = 0;
+
+                #pragma omp parallel for reduction(+:sumv2,asleep_count) reduction(max:vmax)
+                for (int i=0; i<(int)P.size(); ++i) {
+                    const Particle& a = P[i];
+                    if (a.asleep) asleep_count++;
+                    const real v2 = dot(a.v,a.v);
+                    sumv2 += v2;
+                    const real v = std::sqrt(v2);
+                    if (v > vmax) vmax = v;
+                }
+
+                const real vrms = std::sqrt(sumv2 / (real)P.size());
+                const real sleep_frac = (real)asleep_count / (real)P.size();
+
+                bool ok = true;
+                if (g_stop_vrms > 0.0) ok = ok && (vrms <= g_stop_vrms);
+                if (g_stop_vmax > 0.0) ok = ok && (vmax <= g_stop_vmax);
+                if (g_stop_sleep_frac > 0.0) ok = ok && (sleep_frac >= g_stop_sleep_frac);
+
+                ok_checks = ok ? (ok_checks + 1) : 0;
+
+                if (g_debug) {
+                    std::printf("[stop-check] it=%d t=%.3g vrms=%.3g vmax=%.3g asleep=%.3f ok=%d (%d/%d)\n",
+                                it, t, vrms, vmax, sleep_frac, ok?1:0, ok_checks, g_stop_checks_required);
+                }
+
+                if (ok_checks >= std::max(1, g_stop_checks_required)) {
+                    std::printf("[early-stop] settled after phi_target: it=%d t=%.6g vrms=%.3g vmax=%.3g asleep=%.3f\n",
+                                it, t, vrms, vmax, sleep_frac);
+                    break;
+                }
+            }
         }
 
         // 7) dumps & monitor
