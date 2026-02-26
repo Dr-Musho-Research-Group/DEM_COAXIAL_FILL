@@ -1,3 +1,5 @@
+./old/
+./old/*
 *.xyz
 *.mp4
 *.csv

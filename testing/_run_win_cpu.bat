@@ -36,6 +36,25 @@ set GRAVITY=9.81
 set SHAKE_FREQ=1000
 set SHAKE_AMP=5E-6
 
+REM Independent shake amplitudes [m]
+set SHAKE_AMP_X=%SHAKE_AMP%
+set SHAKE_AMP_Y=%SHAKE_AMP%
+set SHAKE_AMP_Z=%SHAKE_AMP%
+set SHAKE_XY_LEGACY=0
+
+REM New: contact cushion [m] (adds clearance around spheres)
+set CUSHION=1E-6
+
+REM Optional wall spring-damper (set WALL_K=0 to disable)
+set WALL_K=0.0
+set WALL_ZETA=0.20
+set WALL_DVMAX=5.0
+
+REM Injection initial velocity [m/s]
+set INJECT_VX=0.0
+set INJECT_VY=0.0
+set INJECT_VZ=-0.5
+
 REM Process stages [s]
 set FILL_TIME=8.0
 set RAM_START=0.0
@@ -83,9 +102,13 @@ echo   THREADS            = %THREADS%
 echo   Rin, Rout, L       = %RIN%, %ROUT%, %LENGTH%
 echo   Flux               = %FLUX%
 echo   Gravity            = %GRAVITY%
-echo   Shake (Hz, Amp)    = %SHAKE_FREQ%, %SHAKE_AMP%
+echo   Shake (Hz)         = %SHAKE_FREQ%
+echo   Shake amps (x,y,z) = %SHAKE_AMP_X%, %SHAKE_AMP_Y%, %SHAKE_AMP_Z% (legacy_xy=%SHAKE_XY_LEGACY%)
 echo   Fill/Ram           = %FILL_TIME%s / %RAM_START%s to %RAM_DURATION%s @ %RAM_SPEED%m/s
 echo   VF Target          = %VF%
+echo   Cushion            = %CUSHION%
+echo   Wall spring (k,zeta,dvmax) = %WALL_K%, %WALL_ZETA%, %WALL_DVMAX%
+echo   Inject v0 (x,y,z)  = %INJECT_VX%, %INJECT_VY%, %INJECT_VZ%
 echo   VTK_INTERVAL       = %VTK_INTERVAL%
 echo   VTK_DOMAIN_INTERVAL= %VTK_DOMAIN_INTERVAL%
 echo ===============================================================
@@ -112,7 +135,18 @@ if not "%XYZ_INTERVAL%"=="" set XYZ_FLAG=--xyz_interval %XYZ_INTERVAL%
   --flux %FLUX% ^
   --gravity %GRAVITY% ^
   --shake_hz %SHAKE_FREQ% ^
-  --shake_amp %SHAKE_AMP% ^
+  --shake_amp %SHAKE_AMP_Z% ^
+  --shake_amp_x %SHAKE_AMP_X% ^
+  --shake_amp_y %SHAKE_AMP_Y% ^
+  --shake_amp_z %SHAKE_AMP_Z% ^
+  --shake_xy_legacy %SHAKE_XY_LEGACY% ^
+  --cushion %CUSHION% ^
+  --wall_k %WALL_K% ^
+  --wall_zeta %WALL_ZETA% ^
+  --wall_dvmax %WALL_DVMAX% ^
+  --inject_vx %INJECT_VX% ^
+  --inject_vy %INJECT_VY% ^
+  --inject_vz %INJECT_VZ% ^
   --fill_time %FILL_TIME% ^
   --ram_start %RAM_START% ^
   --ram_duration %RAM_DURATION% ^

@@ -49,6 +49,7 @@
 #include <random>
 #include <string>
 #include <array>
+#include <limits>
 
 #include <unordered_map>
 #include <cctype>
@@ -142,6 +143,39 @@ real g_g = 9.81f;             // m/s^2 downward
 // shaking (container vertical acceleration via frame motion)
 real g_shake_hz = 1000;
 real g_shake_amp = 9.81;      // meters
+
+// shaking (container acceleration). Existing flags:
+//   --shake_hz, --shake_amp  (legacy: used as vertical amplitude)
+// New (optional) flags allow independent horizontal/vertical shaking:
+//   --shake_amp_x, --shake_amp_y, --shake_amp_z
+// Compatibility:
+//   --shake_xy_legacy 1 keeps the historical behavior where the vertical
+//   shake acceleration was also applied to x and y. Set to 0 to use the
+//   independent axis amplitudes.
+real g_shake_amp_x = 0.0;  // meters
+real g_shake_amp_y = 0.0;  // meters
+real g_shake_amp_z = 0.0;  // meters (alias of g_shake_amp)
+int  g_shake_xy_legacy = 1;
+
+// contact geometry cushion: expands the effective collision radius by this amount
+// (useful for adding a "soft" clearance without changing the physical particle size)
+real g_cushion = 0.0; // meters
+
+// optional wall spring (penalty) model: adds a spring-damper normal response
+// on top of the existing impulse + positional correction wall handling.
+// Set g_wall_k <= 0 to disable.
+real g_wall_k = 0.0;        // N/m
+real g_wall_zeta = 0.20;    // damping ratio (0..1)
+real g_wall_dvmax = 5.0;    // cap on per-step dv from spring-damper [m/s]
+
+// injection initial velocity (set via CLI)
+real g_inject_vx = 0.0;
+real g_inject_vy = 0.0;
+real g_inject_vz = -0.5;
+
+// piston (top wall) normal velocity component along the contact normal
+// (updated once per step in the main loop; used for wall spring damping)
+real g_piston_wall_vn = 0.0;
 
 // drag
 real g_air_visc = 1.8e-5;      // Pa·s (air)
@@ -513,7 +547,9 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
     if (g_sd_sweeps <= 0) return;
 
     // do not overdamp fresh injectees just above the top plane
-    const real max_diam = 1e-6 * max_diam_from_types_um();
+    real max_diam = 1e-6 * max_diam_from_types_um();
+    max_diam += 2.0 * g_cushion;
+    // account for effective collision diameter inflation from cushion
     const real z_guard  = top_z + g_sd_top_guardD * max_diam;
     const real z_guard_lo = top_z - 2.0 * g_sd_top_guardD * max_diam; // band *below* the lid
 
@@ -531,7 +567,7 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
             a.v.x *= keep; a.v.y *= keep; a.v.z *= keep;
 
             // extra tangential damping when touching / almost touching the floor
-            const bool near_floor = (a.p.z <= (a.r + 1e-12));
+            const bool near_floor = (a.p.z <= ((a.r + g_cushion) + 1e-12));
             const bool near_top = (a.p.z >= z_guard);
             const real keep_xy = near_top ? keep : (near_floor ? keep * (1.0 - g_sd_tan_boost) : keep);
             const real keep_z  = keep;
@@ -554,7 +590,7 @@ static inline void successive_damping(std::vector<Particle>& P, real top_z)
 
             a.v.x *= c->keep; a.v.y *= c->keep; a.v.z *= c->keep;
 
-            const bool near_floor = (a.p.z <= (a.r + 1e-12));
+            const bool near_floor = (a.p.z <= ((a.r + g_cushion) + 1e-12));
             const bool near_top = (a.p.z >= c->z_guard);
             const real keep_xy = near_top ? c->keep : (near_floor ? c->keep * (1.0 - g_sd_tan_boost) : c->keep);
             const real keep_z  = c->keep;
@@ -596,13 +632,49 @@ static inline real vertical_shake_accel(real t)
     return -(wf * wf) * amp * std::sin(wf * t + random_phase);
 }
 
+
+static inline void shake_accels(real t, real& ax, real& ay, real& az)
+{
+    ax = ay = az = 0.0;
+    if (g_shake_hz <= 0.0) return;
+
+    const real amp_z = (g_shake_amp_z != 0.0 ? g_shake_amp_z : g_shake_amp);
+    const real w = 2.0 * M_PI * g_shake_hz;
+
+    thread_local std::mt19937 rng(std::random_device{}());
+    std::uniform_real_distribution<real> noise_phase(0.0, 2.0 * M_PI);
+    std::uniform_real_distribution<real> noise_amp(0.8, 1.2);
+    std::uniform_real_distribution<real> noise_freq(0.95, 1.05);
+
+    const real random_phase = noise_phase(rng);
+    const real wf = w * noise_freq(rng);
+
+    auto accel_from_amp = [&](real amp)->real{
+        if (amp == 0.0) return 0.0;
+        const real a = amp * noise_amp(rng);
+        return -(wf * wf) * a * std::sin(wf * t + random_phase);
+    };
+
+    az = accel_from_amp(amp_z);
+
+    if (g_shake_xy_legacy) {
+        ax = az;
+        ay = az;
+    } else {
+        ax = accel_from_amp(g_shake_amp_x);
+        ay = accel_from_amp(g_shake_amp_y);
+    }
+}
+
+
 // uniform point in annulus cross-section for injection (x,y), at z ~ L + margin
 inline void sample_injection_xy(std::mt19937& rng, real rp, real& x, real& y){
     std::uniform_real_distribution<real> U01(0.0, 1.0);
 
     // effective inner/outer radii available to the particle center
-    const real Rin_eff  = g_Rin  + rp;
-    const real Rout_eff = g_Rout - rp;
+    const real rp_eff = rp + g_cushion;
+    const real Rin_eff  = g_Rin  + rp_eff;
+    const real Rout_eff = g_Rout - rp_eff;
 
     // if invalid (no room), clamp or throw
     if (Rout_eff <= Rin_eff){
@@ -652,7 +724,7 @@ inline void collide_pair(Particle& A, Particle& B, real e_common, real tdamp)
     // Geometry
     Vec3 d = B.p - A.p;
     real dist2 = dot(d, d);
-    const real R = A.r + B.r;
+    const real R = (A.r + g_cushion) + (B.r + g_cushion);
     if (dist2 <= 0.0) dist2 = 0.0;
     if (dist2 == 0.0) {
         // Perfect overlap: pick a stable direction from relative velocity or +x
@@ -787,6 +859,23 @@ inline void collide_walls(Particle& a, real top_z, real e_common)
 {
     const real eps = (real)1e-12;
 
+auto apply_wall_spring = [&](const Vec3& n, real pen, real wall_vn)
+{
+    if (g_wall_k <= 0.0 || pen <= 0.0) return;
+
+    const real vn_rel = dot(a.v, n) - wall_vn;
+    const real k = g_wall_k;
+    const real c = 2.0 * g_wall_zeta * std::sqrt(std::max((real)0.0, k * a.m));
+    const real an = (k * pen - c * vn_rel) / a.m;
+
+    real dvn = an * g_dt;
+    if (dvn >  g_wall_dvmax) dvn =  g_wall_dvmax;
+    if (dvn < -g_wall_dvmax) dvn = -g_wall_dvmax;
+
+    a.v = a.v + n * dvn;
+};
+
+
     auto unit_rhat = [&](real x, real y) -> std::pair<real,real> {
         real r = std::hypot(x, y);
         if (r > eps) return {x / r, y / r};
@@ -868,15 +957,18 @@ inline void collide_walls(Particle& a, real top_z, real e_common)
         }
     };
 
+    const real r_eff = a.r + g_cushion;
+
     // ---------------------- INNER CYLINDER (r = g_Rin + a.r) ----------------------
     {
-        const real rmin = g_Rin + a.r;
+        const real rmin = g_Rin + r_eff;
         real rxy = std::hypot(a.p.x, a.p.y);
         if (rxy < rmin)
         {
             const real pen = (rmin - rxy);            // >0 into wall
             auto [rx, ry] = unit_rhat(a.p.x, a.p.y);  // r̂
             Vec3 n = { +rx, +ry, 0.0 };               // normal points outward (toward allowed region)
+            apply_wall_spring(n, pen, (real)0.0);
             // Snap radius exactly to rmin by using position projection in resolve_contact
             resolve_contact(n, pen, /*e_n=*/e_common,
                             /*beta=*/g_wall_beta, /*mu_t=*/g_wall_mu_t,
@@ -889,13 +981,14 @@ inline void collide_walls(Particle& a, real top_z, real e_common)
 
     // ---------------------- OUTER CYLINDER (r = g_Rout - a.r) --------------------
     {
-        const real rmax = g_Rout - a.r;
+        const real rmax = g_Rout - r_eff;
         real rxy = std::hypot(a.p.x, a.p.y);
         if (rxy > rmax)
         {
             const real pen = (rxy - rmax);            // >0 into wall
             auto [rx, ry] = unit_rhat(a.p.x, a.p.y);  // r̂
             Vec3 n = { -rx, -ry, 0.0 };               // normal points inward (toward allowed region)
+            apply_wall_spring(n, pen, (real)0.0);
             resolve_contact(n, pen, /*e_n=*/e_common,
                             /*beta=*/g_wall_beta, /*mu_t=*/g_wall_mu_t,
                             /*roll=*/g_wall_roll, /*v_static=*/(real)0.02);
@@ -907,11 +1000,12 @@ inline void collide_walls(Particle& a, real top_z, real e_common)
 
     // ---------------------- BOTTOM PLANE (z = a.r) --------------------------------
     {
-        const real zbot = a.r;
+        const real zbot = r_eff;
         if (a.p.z < zbot)
         {
             const real pen = (zbot - a.p.z);
             Vec3 n = { 0.0, 0.0, +1.0 };              // up, toward allowed region
+            apply_wall_spring(n, pen, (real)0.0);
             resolve_contact(n, pen, /*e_n=*/g_e_bottom,
                             /*beta=*/g_floor_beta, /*mu_t=*/g_floor_mu_t,
                             /*roll=*/g_floor_roll, /*v_static=*/g_vstatic_floor);
@@ -924,11 +1018,12 @@ inline void collide_walls(Particle& a, real top_z, real e_common)
 
     // ---------------------- TOP PISTON (z = top_z - a.r) --------------------------
     {
-        const real ztop = top_z - a.r;
+        const real ztop = top_z - r_eff;
         if (a.p.z > ztop)
         {
             const real pen = (a.p.z - ztop);
             Vec3 n = { 0.0, 0.0, -1.0 };              // down, toward allowed region
+            apply_wall_spring(n, pen, g_piston_wall_vn);
             resolve_contact(n, pen, /*e_n=*/e_common,
                             /*beta=*/g_wall_beta, /*mu_t=*/g_wall_mu_t,
                             /*roll=*/g_wall_roll, /*v_static=*/(real)0.02);
@@ -976,6 +1071,20 @@ int main(int argc, char** argv){
     g_g = 9.81;
     g_shake_hz = 1000.0;
     g_shake_amp = 5e-6;
+
+    g_shake_amp_x = 0.0;
+    g_shake_amp_y = 0.0;
+    g_shake_amp_z = 0.0;
+    g_shake_xy_legacy = 1;
+
+    g_cushion = 0.0;
+    g_wall_k = 0.0;
+    g_wall_zeta = 0.20;
+    g_wall_dvmax = 5.0;
+
+    g_inject_vx = 0.0;
+    g_inject_vy = 0.0;
+    g_inject_vz = -0.5;
 
     g_fill_time = 8.0;
     g_ram_t0 = 0.0;
@@ -1079,6 +1188,19 @@ int main(int argc, char** argv){
         get_r("gravity", g_g);
         get_r("shake_hz", g_shake_hz);
         get_r("shake_amp", g_shake_amp);
+        get_r("shake_amp_x", g_shake_amp_x);
+        get_r("shake_amp_y", g_shake_amp_y);
+        get_r("shake_amp_z", g_shake_amp_z);
+        get_i("shake_xy_legacy", g_shake_xy_legacy);
+
+        get_r("cushion", g_cushion);
+        get_r("wall_k", g_wall_k);
+        get_r("wall_zeta", g_wall_zeta);
+        get_r("wall_dvmax", g_wall_dvmax);
+
+        get_r("inject_vx", g_inject_vx);
+        get_r("inject_vy", g_inject_vy);
+        get_r("inject_vz", g_inject_vz);
         get_r("fill_time", g_fill_time);
         get_r("ram_start", g_ram_t0);
         get_r("ram_duration", g_ram_dt);
@@ -1096,6 +1218,9 @@ int main(int argc, char** argv){
         // accept some aliases from older batch scripts
         get_r("r_in", g_Rin);
         get_r("r_out", g_Rout);
+        get_r("shake_ampx", g_shake_amp_x);
+        get_r("shake_ampy", g_shake_amp_y);
+        get_r("shake_ampz", g_shake_amp_z);
     }
 
 #if defined(_OPENMP)
@@ -1119,6 +1244,8 @@ init_default_distributions_once();
 
     // domain bbox for neighbor grid
     real max_diam = 1e-6 * max_diam_from_types_um();
+    max_diam += 2.0 * g_cushion;
+    // account for effective collision diameter inflation from cushion
     g_cell_h = std::max(max_diam, 0.5*max_diam) * 1.05; // start near 1.05*D
 
     g_minB = {-g_Rout - max_diam, -g_Rout - max_diam, -max_diam};
@@ -1226,7 +1353,7 @@ init_default_distributions_once();
                         real z = g_L + 2*r;
                         Particle a;
                         a.p = {x,y,z};
-                        a.v = {0,0,-0.5}; // small downward initial velocity
+                        a.v = {g_inject_vx, g_inject_vy, g_inject_vz}; // injection initial velocity
                         a.a = {0,0,0};
                         a.r = r;
                         // mass from per-type density if specified, else global
@@ -1260,7 +1387,7 @@ init_default_distributions_once();
                     real z = g_L + 2*r;
                     Particle a;
                     a.p = {x,y,z};
-                    a.v = {0,0,-0.5};
+                    a.v = {g_inject_vx, g_inject_vy, g_inject_vz};
                     a.a = {0,0,0};
                     a.r = r;
                     {
@@ -1286,6 +1413,8 @@ init_default_distributions_once();
         {
             // Gentle local relaxation for recently injected particles (avoid float suffixes)
             real max_diam = 1e-6 * max_diam_from_types_um();
+            max_diam += 2.0 * g_cushion;
+            // account for effective collision diameter inflation from cushion
             real z_thresh = g_L + 0.5 * max_diam; // consider particles placed above top plane
             std::vector<int> recent;
             recent.reserve(64);
@@ -1314,6 +1443,7 @@ init_default_distributions_once();
         // ------------------------------------------------------------------
         // Compute current top plane position (reuse later)
         real zTop_now = topPlane(t);
+        g_piston_wall_vn = ((t >= g_ram_t0) && (t <= (g_ram_t0 + g_ram_dt)) ? g_ram_speed : 0.0);
         {
             // Wake everyone during the ram window (simple, robust)
             if (t >= g_ram_t0 && t <= (g_ram_t0 + g_ram_dt)) {
@@ -1365,8 +1495,9 @@ init_default_distributions_once();
             }
         }
 
-        // 4.9) set accelerations for this step: gravity + shake + Stokes drag
-        const real a_shake = vertical_shake_accel(t);
+        // 4.9) set accelerations for this step: gravity + shaking-frame accel
+        real a_shake_x=0.0, a_shake_y=0.0, a_shake_z=0.0;
+        shake_accels(t, a_shake_x, a_shake_y, a_shake_z);
 #if defined(_OPENMP)
         #pragma omp parallel for
         for (int i=0; i<(int)P.size(); ++i){
@@ -1376,24 +1507,24 @@ init_default_distributions_once();
             // do NOT push on sleepers
             if (!a.asleep) {
                 // gravity (+ optional shaking frame accel)
-                a.a.x += a_shake;
-                a.a.y += a_shake;
-                a.a.z -= (g_g_run + a_shake);
+                a.a.x += a_shake_x;
+                a.a.y += a_shake_y;
+                a.a.z -= (g_g_run + a_shake_z);
             }
         }
 #else
-        struct AccelCtx { std::vector<Particle>* P; real a_shake; };
+        struct AccelCtx { std::vector<Particle>* P; real a_shake_x; real a_shake_y; real a_shake_z; };
         auto accel_worker = [](int i, void* vctx){
             AccelCtx* c = (AccelCtx*)vctx;
             auto &a = (*(c->P))[i];
             a.a.x = 0.0; a.a.y = 0.0; a.a.z = 0.0;
             if (!a.asleep) {
-                a.a.x += c->a_shake;
-                a.a.y += c->a_shake;
-                a.a.z -= (g_g_run + c->a_shake);
+                a.a.x += c->a_shake_x;
+                a.a.y += c->a_shake_y;
+                a.a.z -= (g_g_run + c->a_shake_z);
             }
         };
-        AccelCtx ctxA{&P, a_shake};
+        AccelCtx ctxA{&P, a_shake_x, a_shake_y, a_shake_z};
         for (int i = 0; i < (int)P.size(); ++i) accel_worker(i, &ctx);
 #endif
 
@@ -1419,7 +1550,7 @@ init_default_distributions_once();
             collide_walls(a, zTop, g_e_pw);
 
             // Extra floor safety clamp (belt-and-suspenders)
-            const real zbot_guard = a.r;
+            const real zbot_guard = a.r + g_cushion;
             if (a.p.z < zbot_guard) {
                 a.p.z = zbot_guard;
                 if (a.v.z < 0.0) a.v.z = 0.0;
@@ -1430,7 +1561,7 @@ init_default_distributions_once();
                         (a.v.x*a.v.x + a.v.y*a.v.y < g_sleep_v*g_sleep_v);
 
             Vec3 dp = {a.p.x - a.prev_p.x, a.p.y - a.prev_p.y, a.p.z - a.prev_p.z};
-            bool on_floor = (a.p.z <= (a.r + 1e-12));
+            bool on_floor = (a.p.z <= ((a.r + g_cushion) + 1e-12));
             bool not_moving = (std::abs(dp.x) < g_sleep_dz &&
                                std::abs(dp.y) < g_sleep_dz &&
                                std::abs(dp.z) < g_sleep_dz);
@@ -1466,7 +1597,7 @@ init_default_distributions_once();
 
             collide_walls(a, c->zTop, g_e_pw);
 
-            const real zbot_guard = a.r;
+            const real zbot_guard = a.r + g_cushion;
             if (a.p.z < zbot_guard) {
                 a.p.z = zbot_guard;
                 if (a.v.z < 0.0) a.v.z = 0.0;
@@ -1476,7 +1607,7 @@ init_default_distributions_once();
                         (a.v.x*a.v.x + a.v.y*a.v.y < g_sleep_v*g_sleep_v);
 
             Vec3 dp = {a.p.x - a.prev_p.x, a.p.y - a.prev_p.y, a.p.z - a.prev_p.z};
-            bool on_floor = (a.p.z <= (a.r + 1e-12));
+            bool on_floor = (a.p.z <= ((a.r + g_cushion) + 1e-12));
             bool not_moving = (std::abs(dp.x) < g_sleep_dz &&
                                std::abs(dp.y) < g_sleep_dz &&
                                std::abs(dp.z) < g_sleep_dz);
