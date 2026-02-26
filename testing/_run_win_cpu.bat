@@ -18,7 +18,7 @@ REM -------------------- User Parameters ---------------------------
 set DEBUG_LEVEL=1
 set NATOMS_MAX=25000
 set DT=2e-6
-set NITER=100000
+set NITER=50000
 set DUMP_INTERVAL=500
 set SEED=42
 
@@ -34,7 +34,7 @@ REM Physics
 set FLUX=60000
 set GRAVITY=9.81
 set SHAKE_FREQ=1000
-set SHAKE_AMP=5E-6
+set SHAKE_AMP=3E-7
 
 REM Independent shake amplitudes [m]
 set SHAKE_AMP_X=%SHAKE_AMP%
@@ -42,13 +42,18 @@ set SHAKE_AMP_Y=%SHAKE_AMP%
 set SHAKE_AMP_Z=%SHAKE_AMP%
 set SHAKE_XY_LEGACY=0
 
-REM New: contact cushion [m] (adds clearance around spheres)
-set CUSHION=1E-6
+REM Contact cushion [m] (adds clearance around spheres)
+set CUSHION=1E-7
 
-REM Optional wall spring-damper (set WALL_K=0 to disable)
+REM Wall spring-damper (set WALL_K=0 to disable)
 set WALL_K=0.0
 set WALL_ZETA=0.20
 set WALL_DVMAX=5.0
+
+REM Wall roughness (set WALL_ROUGH_AMP=0 to disable)
+set WALL_ROUGH_AMP=2e-7
+set WALL_ROUGH_MTH=8
+set WALL_ROUGH_MZ=3
 
 REM Injection initial velocity [m/s]
 set INJECT_VX=0.0
@@ -144,6 +149,9 @@ if not "%XYZ_INTERVAL%"=="" set XYZ_FLAG=--xyz_interval %XYZ_INTERVAL%
   --wall_k %WALL_K% ^
   --wall_zeta %WALL_ZETA% ^
   --wall_dvmax %WALL_DVMAX% ^
+  --wall_rough_amp %WALL_ROUGH_AMP% ^
+  --wall_rough_mth %WALL_ROUGH_MTH% ^
+  --wall_rough_mz  %WALL_ROUGH_MZ% ^
   --inject_vx %INJECT_VX% ^
   --inject_vy %INJECT_VY% ^
   --inject_vz %INJECT_VZ% ^
@@ -188,6 +196,14 @@ echo ===============================================================
 REM -------------------- Postprocessing ----------------------------
 echo Renaming output files...
 rename "output_step_*.xyz" "atoms_*.xyz" >nul 2>&1
+
+echo Running Python stat script if available...
+if exist "_fill_stats.py" (
+    echo _fill_stats.py atoms_%NITER%.xyz --rin %RIN% --rout %ROUT% --length %LENGTH% --rbin 100 -zbin 100 --output stats.csv
+    py.exe _fill_stats.py atoms_%NITER%.xyz --rin %RIN% --rout %ROUT% --length %LENGTH% --rbin 100 -zbin 100 --output stats.csv
+) else (
+    echo (No plot script found, skipping.)
+)
 
 echo Running Python plot script if available...
 if exist "_atoms_plot_all.py" (

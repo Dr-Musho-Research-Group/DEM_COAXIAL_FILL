@@ -50,6 +50,7 @@
 #include <string>
 #include <array>
 #include <limits>
+#include <cstdint>
 
 #include <unordered_map>
 #include <cctype>
@@ -225,6 +226,17 @@ real g_sd_tan_boost   = 0.10;    // smaller extra XY damping near floor
 real g_wall_mu_t   = 0.40;  // tangential friction for cylindrical walls
 real g_wall_roll   = 0.10;  // rolling loss on walls
 real g_wall_beta   = 0.50;  // Baumgarte fraction on walls (0.0..0.5 reasonable)
+
+// Optional: geometric wall roughness on the cylindrical walls.
+// Implemented as a deterministic sinusoidal variation of the effective inner/outer
+// wall radii vs (theta,z). This provides wall "texture" that can reduce strong
+// near-wall layering/segregation for polydisperse packs.
+// Set g_wall_rough_amp <= 0 to disable.
+real g_wall_rough_amp   = 0.0;   // [m] peak roughness amplitude
+int  g_wall_rough_mth   = 8;     // azimuthal modes (>=1)
+int  g_wall_rough_mz    = 3;     // axial modes (>=0)
+real g_wall_rough_phth  = 0.0;   // [rad] azimuthal phase (set from seed)
+real g_wall_rough_phz   = 0.0;   // [rad] axial phase (set from seed)
 // -- particle-particle contact knobs --
 real g_pair_mu_s     = 0.60;   // static friction (stick if within cap)
 real g_pair_mu_k     = 0.40;   // kinetic friction  (<= mu_s)
@@ -858,6 +870,7 @@ inline void collide_pair(Particle& A, Particle& B, real e_common, real tdamp)
 inline void collide_walls(Particle& a, real top_z, real e_common)
 {
     const real eps = (real)1e-12;
+    const real TWO_PI = (real)6.2831853071795864769;
 
 auto apply_wall_spring = [&](const Vec3& n, real pen, real wall_vn)
 {
@@ -883,6 +896,25 @@ auto apply_wall_spring = [&](const Vec3& n, real pen, real wall_vn)
         real vxy = std::hypot(a.v.x, a.v.y);
         if (vxy > eps) return {a.v.x / vxy, a.v.y / vxy};
         return { (real)1.0, (real)0.0 };
+    };
+
+    // Deterministic geometric roughness for cylindrical walls.
+    // Returns an additive radial offset (meters) applied to the *inner* wall radius
+    // and subtracted from the *outer* wall radius (so positive values intrude into
+    // the domain from both sides).
+    auto wall_rough = [&](real x, real y, real z) -> real {
+        if (g_wall_rough_amp <= (real)0.0) return (real)0.0;
+        const int mth = std::max(1, g_wall_rough_mth);
+        const int mz  = std::max(0, g_wall_rough_mz);
+        real th = std::atan2(y, x);
+        // keep theta continuous in [0,2pi)
+        if (th < (real)0.0) th += TWO_PI;
+
+        real f = std::sin((real)mth * th + g_wall_rough_phth);
+        if (mz > 0 && g_L > eps) {
+            f *= std::sin((real)mz * (TWO_PI * (z / g_L)) + g_wall_rough_phz);
+        }
+        return g_wall_rough_amp * f;
     };
 
     auto resolve_contact = [&](const Vec3& n, real pen,
@@ -959,9 +991,17 @@ auto apply_wall_spring = [&](const Vec3& n, real pen, real wall_vn)
 
     const real r_eff = a.r + g_cushion;
 
+    // Clamp roughness amplitude to avoid pathological inversion of the annulus.
+    // This is conservative: allow up to 25% of the local free gap.
+    const real free_gap = (g_Rout - g_Rin) - (real)2.0 * r_eff;
+    const real rough_cap = std::max((real)0.0, (real)0.25 * free_gap);
+
     // ---------------------- INNER CYLINDER (r = g_Rin + a.r) ----------------------
     {
-        const real rmin = g_Rin + r_eff;
+        real rough = wall_rough(a.p.x, a.p.y, a.p.z);
+        if (rough >  rough_cap) rough =  rough_cap;
+        if (rough < -rough_cap) rough = -rough_cap;
+        const real rmin = g_Rin + r_eff + rough;
         real rxy = std::hypot(a.p.x, a.p.y);
         if (rxy < rmin)
         {
@@ -981,7 +1021,10 @@ auto apply_wall_spring = [&](const Vec3& n, real pen, real wall_vn)
 
     // ---------------------- OUTER CYLINDER (r = g_Rout - a.r) --------------------
     {
-        const real rmax = g_Rout - r_eff;
+        real rough = wall_rough(a.p.x, a.p.y, a.p.z);
+        if (rough >  rough_cap) rough =  rough_cap;
+        if (rough < -rough_cap) rough = -rough_cap;
+        const real rmax = g_Rout - r_eff - rough;
         real rxy = std::hypot(a.p.x, a.p.y);
         if (rxy > rmax)
         {
@@ -1049,6 +1092,7 @@ int main(int argc, char** argv){
             "     [--flux N] [--gravity G] [--shake_hz HZ] [--shake_amp A]\n"
             "     [--fill_time T] [--ram_start T0] [--ram_duration DT] [--ram_speed V]\n"
             "     [--phi_target PHI]\n"
+            "     [--wall_rough_amp A] [--wall_rough_mth M] [--wall_rough_mz M]\n"
             "     [--threads N]\n"
             "     [--xyz_interval N] [--vtk_interval N] [--vtk_domain_interval N] [--vtk_domain_segments N]\n",
             argv[0], argv[0]);
@@ -1081,6 +1125,12 @@ int main(int argc, char** argv){
     g_wall_k = 0.0;
     g_wall_zeta = 0.20;
     g_wall_dvmax = 5.0;
+
+    g_wall_rough_amp = 0.0;
+    g_wall_rough_mth = 8;
+    g_wall_rough_mz  = 3;
+    g_wall_rough_phth = 0.0;
+    g_wall_rough_phz  = 0.0;
 
     g_inject_vx = 0.0;
     g_inject_vy = 0.0;
@@ -1198,6 +1248,10 @@ int main(int argc, char** argv){
         get_r("wall_zeta", g_wall_zeta);
         get_r("wall_dvmax", g_wall_dvmax);
 
+        get_r("wall_rough_amp", g_wall_rough_amp);
+        get_i("wall_rough_mth", g_wall_rough_mth);
+        get_i("wall_rough_mz",  g_wall_rough_mz);
+
         get_r("inject_vx", g_inject_vx);
         get_r("inject_vy", g_inject_vy);
         get_r("inject_vz", g_inject_vz);
@@ -1221,6 +1275,22 @@ int main(int argc, char** argv){
         get_r("shake_ampx", g_shake_amp_x);
         get_r("shake_ampy", g_shake_amp_y);
         get_r("shake_ampz", g_shake_amp_z);
+    }
+
+    // If roughness is enabled, derive phases from the RNG seed so runs are repeatable.
+    // (User does not need to supply phases; changing seed changes the texture.)
+    if (g_wall_rough_amp > (real)0.0) {
+        const double TWO_PI = 6.2831853071795864769;
+        uint32_t s = (uint32_t)g_seed;
+        auto next_u01 = [&]()->double{
+            // LCG (Numerical Recipes)
+            s = 1664525u * s + 1013904223u;
+            return (double)(s) / (double)UINT32_MAX;
+        };
+        g_wall_rough_phth = (real)(TWO_PI * next_u01());
+        g_wall_rough_phz  = (real)(TWO_PI * next_u01());
+        g_wall_rough_mth = std::max(1, g_wall_rough_mth);
+        g_wall_rough_mz  = std::max(0, g_wall_rough_mz);
     }
 
 #if defined(_OPENMP)
